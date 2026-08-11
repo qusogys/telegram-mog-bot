@@ -1,3 +1,3 @@
-telethon
-google-generativeai
+telethon==1.44.0
+google-genai
 Pillow
