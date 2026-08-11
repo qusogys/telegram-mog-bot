@@ -1,80 +1,98 @@
-import os, json, sqlite3, hashlib, threading
+import os
+import json
+import sqlite3
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telethon import TelegramClient, events
 from telethon.tl.functions.users import GetFullUserRequest
 import google.generativeai as genai
-from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-# --- КОНФИГ ---
+# 1. ВЕБ-СЕРВЕР ДЛЯ RENDER (Health Check)
+PORT = int(os.environ.get("PORT", 8080))
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+    def log_message(self, format, *args):
+        return
+
+def run_health_server():
+    server = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
+    server.serve_forever()
+
+threading.Thread(target=run_health_server, daemon=True).start()
+
+# 2. КОНФИГ И ИНИЦИАЛИЗАЦИЯ
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-PORT = int(os.environ.get("PORT", 8080))
 
-# --- ИНИЦИАЛИЗАЦИЯ ---
-client = TelegramClient('mog_bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
+client = TelegramClient('mog_bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# --- ГРАФИКА (Возвращаем полную отрисовку) ---
-def get_font(size):
-    return ImageFont.load_default()
+# 3. ОСНОВНАЯ ЛОГИКА
+SYSTEM_PROMPT = """Ты — эксперт по оценке профилей в Telegram (Mogging Battle).
+Оценивай по шкале от 0 до 10 по критериям: 
+1. Аватарка (стиль)
+2. ID (возраст аккаунта: чем меньше ID, тем круче)
+3. Био
+4. Активность (сторис)
 
-def draw_round_avatar(img_path, size=(80, 80)):
-    if img_path and os.path.exists(img_path):
-        img = Image.open(img_path).convert("RGBA")
-        img = ImageOps.fit(img, size, Image.Resampling.LANCZOS)
-        mask = Image.new('L', size, 0); draw = ImageDraw.Draw(mask); draw.ellipse((0,0)+size, fill=255)
-        output = Image.new('RGBA', size, (0,0,0,0)); output.paste(img, (0,0), mask); return output
-    return Image.new('RGBA', size, (60,60,60,255))
+Ответь строго в формате JSON:
+{"overall": 0.0, "avatar_score": 0.0, "og_score": 0.0, "bio_score": 0.0, "comment": "Короткая фраза"}"""
 
-def generate_mog_card(u1, u2, winner_idx):
-    # Рисуем карточку (упрощенная версия для примера)
-    width, height = 500, 400
-    card = Image.new("RGB", (width, height), (20, 20, 20))
-    draw = ImageDraw.Draw(card)
-    
-    # Вставляем аватары
-    av1 = draw_round_avatar(u1['photo_path'])
-    av2 = draw_round_avatar(u2['photo_path'])
-    card.paste(av1, (50, 100))
-    card.paste(av2, (370, 100))
-    
-    # Текст результатов
-    draw.text((150, 250), f"Overall: {u1['scores']['overall']}", fill="white")
-    draw.text((370, 250), f"Overall: {u2['scores']['overall']}", fill="white")
-    
-    card.save("result.png")
-    return "result.png"
-
-# --- ЛОГИКА ---
 async def get_user_data(username_or_id):
     try:
         entity = await client.get_entity(username_or_id)
         full = await client(GetFullUserRequest(entity))
-        photo = await client.download_profile_photo(entity, file=f"avatar_{entity.id}.jpg")
-        try: stories = await client.get_stories(entity); has_stories = len(stories.stories) > 0
+        try: 
+            stories = await client.get_stories(entity)
+            has_stories = len(stories.stories) > 0
         except: has_stories = False
-        return {"username": entity.username or "user", "id": entity.id, "bio": full.full_user.about or "", "has_stories": has_stories, "has_channel": full.full_user.personal_channel_id is not None, "photo_path": photo}
-    except: return None
+        return {
+            "username": entity.username or "user",
+            "id": entity.id,
+            "bio": full.full_user.about or "Нет био",
+            "has_stories": has_stories
+        }
+    except Exception as e:
+        print(f"Ошибка получения данных: {e}")
+        return None
 
-@client.on(events.NewMessage(pattern=r'\.мог(?:\s+([^\s]+))?(?:\s+([^\s]+))?'))
+@client.on(events.NewMessage(pattern=r'\.мог(?:\s+([^\s]+))?'))
 async def handler(event):
-    args = event.pattern_match.groups()
-    u1 = await get_user_data(args[0])
-    u2 = await get_user_data(args[1] if args[1] else (await event.get_sender()).username)
+    target = event.pattern_match.group(1)
+    if not target:
+        sender = await event.get_sender()
+        target = sender.username
     
-    # Оценка AI
-    for u in [u1, u2]:
-        prompt = f"Оцени профиль (ID:{u['id']}, Stories:{u['has_stories']}). JSON: {{'overall': 0.0, 'rank': '...'}}"
-        contents = [prompt, Image.open(u['photo_path']) if u['photo_path'] else "No photo"]
-        res = model.generate_content(contents)
-        u['scores'] = json.loads(res.text.replace("```json", "").replace("```", "").strip())
-        u['scores']['username'] = u['username']
-    
-    winner = 1 if u1['scores']['overall'] >= u2['scores']['overall'] else 2
-    card = generate_mog_card(u1, u2, winner)
-    await client.send_file(event.chat_id, card, caption=f"Победил @{u1['username'] if winner==1 else u2['username']}")
+    data = await get_user_data(target)
+    if not data:
+        await event.reply("Не могу найти такого пользователя.")
+        return
 
+    # Оценка нейросетью
+    prompt = f"{SYSTEM_PROMPT}\nДанные: {data}"
+    response = model.generate_content(prompt)
+    
+    try:
+        res_text = response.text.replace("```json", "").replace("```", "").strip()
+        scores = json.loads(res_text)
+        
+        reply = (f"🔥 **Mogging Report для @{data['username']}**\n\n"
+                 f"Общий балл: {scores['overall']}/10\n"
+                 f"Аватар: {scores['avatar_score']}\n"
+                 f"OG Статус: {scores['og_score']}\n"
+                 f"Био: {scores['bio_score']}\n\n"
+                 f"Вердикт: {scores['comment']}")
+        await event.reply(reply)
+    except Exception as e:
+        await event.reply("Ошибка при генерации оценки.")
+        print(e)
+
+print("Бот запущен...")
 client.run_until_disconnected()
