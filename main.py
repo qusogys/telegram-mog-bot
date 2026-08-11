@@ -29,7 +29,7 @@ threading.Thread(target=run_health_server, daemon=True).start()
 # --- ИНИЦИАЛИЗАЦИЯ ---
 genai.configure(api_key=GEMINI_API_KEY)
 # ВАЖНО: Используем актуальную модель, которая поддерживает generateContent
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-3.5-flash-lite')
 client = TelegramClient('mog_bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
 SYSTEM_PROMPT = """Ты — циничный судья Mogging Battle. Сравни двух пользователей (1 и 2) по 10-балльной шкале. Учитывай ID (OG статус), Аватарку, Bio и Наличие сторис (Активность).
