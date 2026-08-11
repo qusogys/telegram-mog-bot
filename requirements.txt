@@ -1,3 +1,2 @@
 telethon
 google-generativeai
-pillow
