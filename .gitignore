@@ -4,4 +4,5 @@
 __pycache__/
 *.pyc
 avatar_*.jpg
-mog_card.png
+mog_card_*.png
+mogging.db
