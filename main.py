@@ -1,21 +1,42 @@
 import os
 import re
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telethon import TelegramClient, events
 from telethon.tl.functions.users import GetFullUserRequest
 import google.generativeai as genai
 from PIL import Image
 
-# Чтение токенов из переменных окружения
+# 1. Чтение токенов из переменных окружения
 API_ID = int(os.environ.get("API_ID", 0) or 0)
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+PORT = int(os.environ.get("PORT", 8080))
 
-# Настройка Gemini
+# 2. Настройка фонового веб-сервера для хостинга Render (Health Check)
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        # Отключаем выводимые логи запросов от cron-job
+        return
+
+def run_health_server():
+    server = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
+    server.serve_forever()
+
+# Запускаем веб-сервер в отдельном потоке
+threading.Thread(target=run_health_server, daemon=True).start()
+
+# 3. Настройка Gemini API
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
 
-# Инициализация Telethon (MTProto)
+# 4. Инициализация Telethon (MTProto)
 client = TelegramClient('mog_bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
 SYSTEM_PROMPT = """Ты — ироничный эксперт по оценке профилей в Telegram (Mogging judge).
@@ -97,7 +118,7 @@ async def mog_handler(event):
     user2 = await get_user_data(target2_name)
 
     if not user1 or not user2:
-        await msg.edit("❌ Не удалось получить данные одного из пользователей. Убедитесь, что юзернеймы указаны верно и пользователи существуют.")
+        await msg.edit("❌ Не удалось получить данные одного из пользователей. Убедитесь, что юзернеймы указаны верно и профили открыты.")
         return
 
     # Подготовка данных для Gemini
@@ -109,7 +130,7 @@ async def mog_handler(event):
     opened_files = []
 
     try:
-        # Добавляем аватарки
+        # Загружаем аватарки в запрос
         for i, u in enumerate([user1, user2]):
             if u['photo_path'] and os.path.exists(u['photo_path']):
                 img = Image.open(u['photo_path'])
@@ -119,13 +140,13 @@ async def mog_handler(event):
             else:
                 contents.append(f"У Игрока {i+1} нет аватарки.")
 
-        # Запрос к нейросети
+        # Генерация ответа ИИ
         response = model.generate_content(contents)
         await msg.edit(response.text)
     except Exception as e:
         await msg.edit(f"❌ Ошибка при обращении к ИИ: {e}")
     finally:
-        # Очистка временных файлов (чтобы сервер не забился картинками)
+        # Автоматическая очистка временных аватарок из диска
         for path in opened_files:
             if os.path.exists(path):
                 try:
@@ -135,7 +156,8 @@ async def mog_handler(event):
 
 if __name__ == '__main__':
     if not all([API_ID, API_HASH, BOT_TOKEN, GEMINI_API_KEY]):
-        print("ВНИМАНИЕ: Не все переменные окружения (API_ID, API_HASH, BOT_TOKEN, GEMINI_API_KEY) заданы. Бот может не запуститься.")
+        print("ВНИМАНИЕ: Не все переменные окружения (API_ID, API_HASH, BOT_TOKEN, GEMINI_API_KEY) заданы!")
     else:
+        print(f"✅ Фоновый веб-сервер запущен на порту {PORT}")
         print("✅ Бот успешно запущен. Ожидание команд...")
         client.run_until_disconnected()
