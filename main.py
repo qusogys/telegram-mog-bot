@@ -34,7 +34,7 @@ threading.Thread(target=run_health_server, daemon=True).start()
 
 # 3. Настройка Gemini API
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-2.0-flash')
 
 # 4. Инициализация Telethon (MTProto)
 client = TelegramClient('mog_bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
