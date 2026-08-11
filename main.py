@@ -1,23 +1,22 @@
 import os
 import io
 import json
-import hashlib
+import time
 import asyncio
+import hashlib
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telethon import TelegramClient, events
-from telethon.tl.functions.users import GetFullUserRequest
-
 from google import genai
 from google.genai import types
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 
-# =========================================================
+# ============================================================
 # CONFIG
-# =========================================================
+# ============================================================
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
@@ -26,34 +25,43 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 PORT = int(os.getenv("PORT", "10000"))
 
-MODEL = os.getenv(
+# Быстрая Flash-модель.
+# Можно переопределить через Render Environment Variables.
+GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
     "gemini-3-flash-preview"
 )
 
-DATA_FILE = "ratings.json"
+DB_FILE = "ratings.json"
+
+# Размер картинки, которую отправляем Gemini.
+# 256 обычно более чем достаточно для оценки аватара.
+AI_IMAGE_SIZE = 256
+
+# Не пересчитываем абсолютно одинаковый профиль.
+CACHE_TTL = 60 * 60 * 24 * 30
 
 
-# =========================================================
-# ПРОВЕРКА
-# =========================================================
+# ============================================================
+# VALIDATION
+# ============================================================
 
 if not API_ID:
-    raise RuntimeError("Не указан API_ID")
+    raise RuntimeError("API_ID не указан")
 
 if not API_HASH:
-    raise RuntimeError("Не указан API_HASH")
+    raise RuntimeError("API_HASH не указан")
 
 if not BOT_TOKEN:
-    raise RuntimeError("Не указан BOT_TOKEN")
+    raise RuntimeError("BOT_TOKEN не указан")
 
 if not GEMINI_API_KEY:
-    raise RuntimeError("Не указан GEMINI_API_KEY")
+    raise RuntimeError("GEMINI_API_KEY не указан")
 
 
-# =========================================================
+# ============================================================
 # RENDER HEALTH CHECK
-# =========================================================
+# ============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
@@ -70,36 +78,36 @@ class HealthHandler(BaseHTTPRequestHandler):
         pass
 
 
-def health_server():
+def run_health_server():
 
     server = HTTPServer(
         ("0.0.0.0", PORT),
         HealthHandler
     )
 
-    print(f"Health server: {PORT}")
+    print(f"[WEB] Health server on {PORT}")
 
     server.serve_forever()
 
 
 threading.Thread(
-    target=health_server,
+    target=run_health_server,
     daemon=True
 ).start()
 
 
-# =========================================================
-# AI
-# =========================================================
+# ============================================================
+# GEMINI
+# ============================================================
 
 ai = genai.Client(
     api_key=GEMINI_API_KEY
 )
 
 
-# =========================================================
+# ============================================================
 # TELEGRAM
-# =========================================================
+# ============================================================
 
 client = TelegramClient(
     "mog_bot_session",
@@ -108,19 +116,19 @@ client = TelegramClient(
 )
 
 
-# =========================================================
+# ============================================================
 # DATABASE
-# =========================================================
+# ============================================================
 
 def load_db():
 
-    if not os.path.exists(DATA_FILE):
+    if not os.path.exists(DB_FILE):
         return {}
 
     try:
 
         with open(
-            DATA_FILE,
+            DB_FILE,
             "r",
             encoding="utf-8"
         ) as f:
@@ -129,7 +137,7 @@ def load_db():
 
     except Exception as e:
 
-        print("DB load error:", e)
+        print("[DB] load error:", e)
 
         return {}
 
@@ -141,10 +149,10 @@ def save_db():
 
     try:
 
-        temp = DATA_FILE + ".tmp"
+        tmp = DB_FILE + ".tmp"
 
         with open(
-            temp,
+            tmp,
             "w",
             encoding="utf-8"
         ) as f:
@@ -157,20 +165,29 @@ def save_db():
             )
 
         os.replace(
-            temp,
-            DATA_FILE
+            tmp,
+            DB_FILE
         )
 
     except Exception as e:
 
-        print("DB save error:", e)
+        print("[DB] save error:", e)
 
 
-# =========================================================
-# RANK
-# =========================================================
+# ============================================================
+# LOCK
+# ============================================================
+
+db_lock = asyncio.Lock()
+
+
+# ============================================================
+# RANKS
+# ============================================================
 
 def get_rank(score):
+
+    score = float(score)
 
     if score < 3:
         return "Sub-3"
@@ -193,29 +210,56 @@ def get_rank(score):
     return "True Adam"
 
 
-# =========================================================
+# ============================================================
 # HELPERS
-# =========================================================
+# ============================================================
 
-def clean_username(username):
+def username_clean(value):
 
-    if not username:
-        return "unknown"
+    if not value:
+        return ""
 
-    return username.replace(
+    return str(value).replace(
         "@",
         ""
     ).strip()
 
 
+def clamp_score(value):
+
+    try:
+
+        value = float(value)
+
+    except:
+
+        value = 0
+
+    return round(
+        max(
+            0,
+            min(
+                10,
+                value
+            )
+        ),
+        2
+    )
+
+
 def profile_hash(user):
 
+    """
+    Хэш только тех данных, которые реально оцениваются.
+    """
+
     data = {
-        "username": user["username"],
-        "name": user["name"],
-        "bio": user["bio"],
-        "avatar": bool(
-            user["photo"]
+        "username": user.get("username", ""),
+        "name": user.get("name", ""),
+        "bio": user.get("bio", ""),
+        "avatar_hash": user.get(
+            "avatar_hash",
+            ""
         )
     }
 
@@ -230,23 +274,17 @@ def profile_hash(user):
     ).hexdigest()
 
 
-def safe_score(value):
+def pair_hash(u1, u2):
 
-    try:
+    h1 = profile_hash(u1)
+    h2 = profile_hash(u2)
 
-        value = float(value)
+    # Порядок сохраняем.
+    raw = h1 + ":" + h2
 
-        return max(
-            0,
-            min(
-                10,
-                value
-            )
-        )
-
-    except:
-
-        return 0
+    return hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()
 
 
 def clean_json(text):
@@ -267,7 +305,7 @@ def clean_json(text):
 
     if start == -1 or end == -1:
         raise ValueError(
-            "AI не вернул JSON"
+            "Gemini не вернул JSON"
         )
 
     return json.loads(
@@ -275,11 +313,11 @@ def clean_json(text):
     )
 
 
-# =========================================================
+# ============================================================
 # FONTS
-# =========================================================
+# ============================================================
 
-def font(size):
+def get_font(size):
 
     paths = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -302,13 +340,88 @@ def font(size):
     return ImageFont.load_default()
 
 
-# =========================================================
-# AVATAR
-# =========================================================
+# ============================================================
+# FAST AVATAR PROCESSING
+# ============================================================
+
+def prepare_avatar(path):
+
+    """
+    Быстро превращает аватар в маленький JPEG.
+    Это сильно уменьшает время/объём запроса к Gemini.
+    """
+
+    if not path:
+        return None
+
+    if not os.path.exists(path):
+        return None
+
+    try:
+
+        img = Image.open(
+            path
+        ).convert("RGB")
+
+        img.thumbnail(
+            (
+                AI_IMAGE_SIZE,
+                AI_IMAGE_SIZE
+            ),
+            Image.Resampling.LANCZOS
+        )
+
+        buffer = io.BytesIO()
+
+        img.save(
+            buffer,
+            format="JPEG",
+            quality=75,
+            optimize=True
+        )
+
+        return buffer.getvalue()
+
+    except Exception as e:
+
+        print(
+            "[IMAGE] error:",
+            e
+        )
+
+        return None
+
+
+def avatar_hash(path):
+
+    if not path:
+        return ""
+
+    try:
+
+        # Хэшируем сам файл.
+        # Для маленьких Telegram-аватаров это быстро.
+        with open(
+            path,
+            "rb"
+        ) as f:
+
+            return hashlib.md5(
+                f.read()
+            ).hexdigest()
+
+    except:
+
+        return ""
+
+
+# ============================================================
+# AVATAR FOR CARD
+# ============================================================
 
 def make_avatar(
     path,
-    size=150
+    size=145
 ):
 
     if path and os.path.exists(path):
@@ -361,11 +474,9 @@ def make_avatar(
         (70, 70, 75, 255)
     )
 
-    draw = ImageDraw.Draw(
+    ImageDraw.Draw(
         result
-    )
-
-    draw.ellipse(
+    ).ellipse(
         (0, 0, size, size),
         fill=(100, 100, 105, 255)
     )
@@ -373,9 +484,9 @@ def make_avatar(
     return result
 
 
-# =========================================================
+# ============================================================
 # MOGGED
-# =========================================================
+# ============================================================
 
 def add_mogged(avatar):
 
@@ -392,14 +503,14 @@ def add_mogged(avatar):
     draw.text(
         (125, 35),
         "MOGGED",
-        font=font(32),
+        font=get_font(31),
         fill=(235, 20, 40),
         stroke_width=3,
         stroke_fill=(0, 0, 0),
         anchor="mm"
     )
 
-    # Наклон 12 градусов
+    # Ровно 12 градусов.
     stamp = stamp.rotate(
         12,
         expand=True,
@@ -424,11 +535,11 @@ def add_mogged(avatar):
     return avatar
 
 
-# =========================================================
+# ============================================================
 # SCORE BAR
-# =========================================================
+# ============================================================
 
-def score_bar(
+def draw_bar(
     draw,
     x,
     y,
@@ -441,33 +552,35 @@ def score_bar(
             x,
             y,
             x + width,
-            y + 10
+            y + 9
         ),
         radius=5,
         fill=(55, 55, 60)
     )
 
-    filled = int(
-        width * score / 10
+    fill = int(
+        width *
+        clamp_score(score) /
+        10
     )
 
-    if filled > 0:
+    if fill > 0:
 
         draw.rounded_rectangle(
             (
                 x,
                 y,
-                x + filled,
-                y + 10
+                x + fill,
+                y + 9
             ),
             radius=5,
             fill=(255, 204, 0)
         )
 
 
-# =========================================================
+# ============================================================
 # CARD
-# =========================================================
+# ============================================================
 
 def make_card(
     u1,
@@ -488,25 +601,33 @@ def make_card(
         card
     )
 
+    title_font = get_font(32)
+    sub_font = get_font(16)
+    username_font = get_font(22)
+    rank_font = get_font(20)
+    small_font = get_font(14)
+
     draw.text(
-        (W // 2, 40),
+        (W // 2, 38),
         "MOG BATTLE",
-        font=font(32),
+        font=title_font,
         fill=(255, 204, 0),
         anchor="mm"
     )
 
     draw.text(
-        (W // 2, 78),
+        (W // 2, 74),
         "НИК • АВАТАР • BIO",
-        font=font(17),
-        fill=(170, 170, 175),
+        font=sub_font,
+        fill=(165, 165, 170),
         anchor="mm"
     )
 
-    winner = result["winner"]
+    winner = int(
+        result["winner"]
+    )
 
-    def player(
+    def draw_player(
         y,
         user,
         data,
@@ -527,7 +648,7 @@ def make_card(
         )
 
         avatar = make_avatar(
-            user["photo"],
+            user.get("photo"),
             145
         )
 
@@ -540,68 +661,81 @@ def make_card(
             avatar,
             (
                 W // 2 - 72,
-                y + 20
+                y + 18
             ),
             avatar
         )
 
-        username = (
-            user["username"]
-            or "без username"
+        name = (
+            user.get("username")
+            or user.get("name")
+            or "unknown"
         )
 
         draw.text(
-            (W // 2, y + 185),
-            "@" + username,
-            font=font(23),
+            (W // 2, y + 180),
+            "@" + name,
+            font=username_font,
             fill=(245, 245, 245),
             anchor="mm"
         )
 
         draw.text(
-            (W // 2, y + 218),
+            (
+                W // 2,
+                y + 213
+            ),
             f'{data["rank"]} • {data["overall"]:.1f}/10',
-            font=font(20),
+            font=rank_font,
             fill=(255, 204, 0),
             anchor="mm"
         )
 
         rows = [
-            ("НИК", data["nick_score"]),
-            ("АВАТАР", data["avatar_score"]),
-            ("BIO", data["bio_score"])
+            (
+                "НИК",
+                data["nick_score"]
+            ),
+            (
+                "АВАТАР",
+                data["avatar_score"]
+            ),
+            (
+                "BIO",
+                data["bio_score"]
+            )
         ]
 
-        yy = y + 255
+        yy = y + 252
 
         for label, score in rows:
 
             draw.text(
                 (55, yy),
                 label,
-                font=font(14),
+                font=small_font,
                 fill=(170, 170, 175)
             )
 
             draw.text(
                 (W - 55, yy),
                 f"{score:.1f}",
-                font=font(14),
+                font=small_font,
                 fill=(245, 245, 245),
                 anchor="ra"
             )
 
-            score_bar(
+            draw_bar(
                 draw,
                 55,
-                yy + 25,
+                yy + 22,
                 W - 110,
                 score
             )
 
             yy += 47
 
-    player(
+    draw_player(
         105,
         u1,
         result["u1"],
@@ -611,12 +745,12 @@ def make_card(
     draw.text(
         (W // 2, 525),
         "VS",
-        font=font(30),
+        font=get_font(30),
         fill=(255, 255, 255),
         anchor="mm"
     )
 
-    player(
+    draw_player(
         570,
         u2,
         result["u2"],
@@ -626,7 +760,7 @@ def make_card(
     draw.text(
         (W // 2, 1000),
         f'РАЗРЫВ: {result["gap"]:.1f}',
-        font=font(20),
+        font=get_font(20),
         fill=(255, 204, 0),
         anchor="mm"
     )
@@ -635,17 +769,29 @@ def make_card(
 
     card.save(
         path,
-        quality=95
+        "PNG",
+        optimize=True
     )
 
     return path
 
 
-# =========================================================
-# GET TELEGRAM USER
-# =========================================================
+# ============================================================
+# TELEGRAM USER
+# ============================================================
 
-async def get_user(identifier):
+async def get_user(
+    identifier,
+    cached=None
+):
+
+    """
+    Минимум Telegram-запросов.
+
+    GetFullUserRequest не используется.
+    Bio берём из обычного entity/full entity,
+    если Telethon его уже получил.
+    """
 
     try:
 
@@ -653,111 +799,220 @@ async def get_user(identifier):
             identifier
         )
 
-        full = await client(
-            GetFullUserRequest(entity)
+        # entity обычно содержит bio только если
+        # Telethon уже получил соответствующую информацию.
+        # Если нет — один дополнительный запрос.
+        bio = getattr(
+            entity,
+            "about",
+            None
         )
 
-        photo = None
+        if bio is None:
 
-        try:
+            try:
 
-            photo = await client.download_profile_photo(
+                full = await client.get_entity(
+                    entity
+                )
+
+                bio = getattr(
+                    full,
+                    "about",
+                    ""
+                ) or ""
+
+            except:
+
+                bio = ""
+
+        username = username_clean(
+            getattr(
                 entity,
-                file=f"avatar_{entity.id}"
+                "username",
+                ""
+            )
+        )
+
+        name = (
+            getattr(
+                entity,
+                "first_name",
+                ""
+            )
+            or ""
+        )
+
+        photo_path = None
+
+        # Сначала смотрим локальный кэш.
+        if cached:
+
+            old_path = cached.get(
+                "photo"
             )
 
-        except:
-            pass
+            if (
+                old_path
+                and
+                os.path.exists(old_path)
+            ):
 
-        return {
+                photo_path = old_path
+
+        # Если локального файла нет — скачиваем.
+        if not photo_path:
+
+            try:
+
+                photo_path = (
+                    await client.download_profile_photo(
+                        entity,
+                        file=f"avatar_{entity.id}"
+                    )
+                )
+
+            except:
+
+                photo_path = None
+
+        result = {
             "id": int(entity.id),
-
-            "username": clean_username(
-                entity.username
-            ),
-
-            "name": (
-                entity.first_name or ""
-            ),
-
-            "bio": (
-                full.full_user.about
-                or ""
-            ),
-
-            "photo": photo
+            "username": username,
+            "name": name,
+            "bio": bio or "",
+            "photo": photo_path,
+            "avatar_hash": avatar_hash(
+                photo_path
+            )
         }
+
+        return result
 
     except Exception as e:
 
         print(
-            "Telegram user error:",
+            "[TG] user error:",
             e
         )
 
         return None
 
 
-# =========================================================
-# AI
-# =========================================================
+# ============================================================
+# FAST GET TWO USERS
+# ============================================================
+
+async def get_two_users(
+    first,
+    second
+):
+
+    """
+    Главное ускорение:
+    два Telegram-запроса выполняются одновременно.
+    """
+
+    cached1 = None
+    cached2 = None
+
+    try:
+
+        # Если это username — пытаемся найти старую запись.
+        first_name = username_clean(
+            first
+        )
+
+        second_name = username_clean(
+            second
+        )
+
+        for value in db.values():
+
+            if value.get("username") == first_name:
+                cached1 = value
+
+            if value.get("username") == second_name:
+                cached2 = value
+
+    except:
+        pass
+
+    return await asyncio.gather(
+        get_user(
+            first,
+            cached1
+        ),
+        get_user(
+            second,
+            cached2
+        )
+    )
+
+
+# ============================================================
+# AI PROMPT
+# ============================================================
 
 SYSTEM_PROMPT = """
-Ты строгий и максимально нейтральный судья Telegram-профилей.
+Ты строгий, серьёзный и нейтральный судья Telegram-профилей.
 
-ОЦЕНИВАЙ ТОЛЬКО:
+ОЦЕНИВАЙ ТОЛЬКО ТРИ ВЕЩИ:
 
 1. Ник / username — 30%
 2. Аватар — 40%
 3. Bio — 30%
 
-НЕ ОЦЕНИВАЙ:
+НИКОГДА НЕ ОЦЕНИВАЙ:
 - Telegram ID
 - дату регистрации
 - количество подписчиков
 - сторис
 - активность
-- личность человека
 - возраст
 - пол
 - национальность
-- внешность человека как характеристику личности.
+- личность человека
+- социальный статус человека.
 
-Оценивай именно качество профиля.
+Оценивается исключительно качество Telegram-профиля.
 
-Система рангов:
+Ранги:
 
-Sub-3 = 0.0-2.9
-Sub-5 = 3.0-4.9
-LTN = 5.0-5.9
-MTN = 6.0-6.9
-HTN = 7.0-7.9
-Chad = 8.0-8.9
-True Adam = 9.0-10.0
+Sub-3 = 0.0–2.9
+Sub-5 = 3.0–4.9
+LTN = 5.0–5.9
+MTN = 6.0–6.9
+HTN = 7.0–7.9
+Chad = 8.0–8.9
+True Adam = 9.0–10.0
 
-Будь строгим.
+Будь строгим и объективным.
 Не завышай оценки.
-Не унижай пользователя.
-Не используй оскорбления.
+Не унижай людей.
 
-Для каждой характеристики обязательно объясни,
-почему выставлена именно такая оценка.
+Для каждого игрока объясни:
+- почему такая оценка ника;
+- почему такая оценка аватара;
+- почему такая оценка Bio.
 
-Верни ТОЛЬКО JSON:
+Верни ТОЛЬКО JSON.
+
+Формат:
 
 {
   "winner": 1,
   "gap": 1.2,
-  "explanation": "Краткое нейтральное объяснение победы",
+  "explanation": "Краткое объяснение победы",
 
   "u1": {
     "username": "username",
     "nick_score": 7.0,
-    "nick_text": "Объяснение",
+    "nick_text": "Причина",
     "avatar_score": 8.0,
-    "avatar_text": "Объяснение",
+    "avatar_text": "Причина",
     "bio_score": 6.0,
-    "bio_text": "Объяснение",
+    "bio_text": "Причина",
     "overall": 7.1,
     "rank": "HTN"
   },
@@ -765,11 +1020,11 @@ True Adam = 9.0-10.0
   "u2": {
     "username": "username",
     "nick_score": 6.0,
-    "nick_text": "Объяснение",
+    "nick_text": "Причина",
     "avatar_score": 5.0,
-    "avatar_text": "Объяснение",
+    "avatar_text": "Причина",
     "bio_score": 6.0,
-    "bio_text": "Объяснение",
+    "bio_text": "Причина",
     "overall": 5.7,
     "rank": "LTN"
   }
@@ -777,15 +1032,38 @@ True Adam = 9.0-10.0
 """
 
 
-async def ai_compare(
+# ============================================================
+# BUILD AI CONTENT
+# ============================================================
+
+def build_ai_content(
     u1,
-    u2
+    u2=None
 ):
 
-    prompt = f"""
+    if u2 is None:
+
+        prompt = f"""
 {SYSTEM_PROMPT}
 
-ПРОФИЛЬ 1
+ПРОФИЛЬ:
+
+Username:
+@{u1["username"]}
+
+Имя:
+{u1["name"]}
+
+Bio:
+{u1["bio"]}
+"""
+
+    else:
+
+        prompt = f"""
+{SYSTEM_PROMPT}
+
+ПРОФИЛЬ 1:
 
 Username:
 @{u1["username"]}
@@ -797,7 +1075,7 @@ Bio:
 {u1["bio"]}
 
 
-ПРОФИЛЬ 2
+ПРОФИЛЬ 2:
 
 Username:
 @{u2["username"]}
@@ -809,90 +1087,68 @@ Bio:
 {u2["bio"]}
 """
 
-    contents = [
-        prompt
-    ]
+    contents = [prompt]
 
     for user in (
-        u1,
-        u2
+        [u1]
+        if u2 is None
+        else [u1, u2]
     ):
 
-        if not user["photo"]:
-            continue
+        image_data = prepare_avatar(
+            user.get("photo")
+        )
 
-        try:
-
-            buffer = io.BytesIO()
-
-            Image.open(
-                user["photo"]
-            ).convert(
-                "RGB"
-            ).save(
-                buffer,
-                "JPEG",
-                quality=90
-            )
+        if image_data:
 
             contents.append(
                 types.Part.from_bytes(
-                    data=buffer.getvalue(),
+                    data=image_data,
                     mime_type="image/jpeg"
                 )
             )
 
-        except Exception as e:
+    return contents
 
-            print(
-                "Image error:",
-                e
-            )
 
-    response = await asyncio.to_thread(
-        ai.models.generate_content,
-        model=MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            temperature=0.15,
-            response_mime_type="application/json"
-        )
-    )
+# ============================================================
+# RECALCULATE RESULT
+# ============================================================
 
-    result = clean_json(
-        response.text
-    )
+def normalize_result(
+    result
+):
 
-    # Принудительно пересчитываем итог,
-    # чтобы AI не мог ошибиться в математике.
     for key in (
         "u1",
         "u2"
     ):
 
-        p = result[key]
+        data = result[key]
 
-        p["nick_score"] = safe_score(
-            p.get("nick_score")
+        data["nick_score"] = clamp_score(
+            data.get("nick_score")
         )
 
-        p["avatar_score"] = safe_score(
-            p.get("avatar_score")
+        data["avatar_score"] = clamp_score(
+            data.get("avatar_score")
         )
 
-        p["bio_score"] = safe_score(
-            p.get("bio_score")
+        data["bio_score"] = clamp_score(
+            data.get("bio_score")
         )
 
-        p["overall"] = round(
-            p["nick_score"] * 0.30
-            + p["avatar_score"] * 0.40
-            + p["bio_score"] * 0.30,
+        data["overall"] = round(
+            data["nick_score"] * 0.30
+            +
+            data["avatar_score"] * 0.40
+            +
+            data["bio_score"] * 0.30,
             2
         )
 
-        p["rank"] = get_rank(
-            p["overall"]
+        data["rank"] = get_rank(
+            data["overall"]
         )
 
     if (
@@ -919,98 +1175,151 @@ Bio:
     return result
 
 
-# =========================================================
-# SAVE RATING
-# =========================================================
+# ============================================================
+# FAST GEMINI
+# ============================================================
 
-def save_rating(
+async def call_gemini(
+    contents
+):
+
+    response = await asyncio.to_thread(
+        ai.models.generate_content,
+        model=GEMINI_MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            response_mime_type="application/json",
+            max_output_tokens=1200
+        )
+    )
+
+    return clean_json(
+        response.text
+    )
+
+
+# ============================================================
+# CACHE SAVE
+# ============================================================
+
+async def save_user_rating(
     user,
-    result,
-    chat_id
+    data,
+    chat_id=None
 ):
 
     uid = str(
         user["id"]
     )
 
-    old = db.get(
-        uid,
-        {}
-    )
+    async with db_lock:
 
-    chats = old.get(
-        "chats",
-        []
-    )
+        old = db.get(
+            uid,
+            {}
+        )
 
-    if chat_id is not None:
+        chats = old.get(
+            "chats",
+            []
+        )
 
-        if str(chat_id) not in chats:
+        if chat_id is not None:
 
-            chats.append(
-                str(chat_id)
+            chat = str(
+                chat_id
             )
 
-    db[uid] = {
-        "id": user["id"],
-        "username": user["username"],
-        "name": user["name"],
-        "bio": user["bio"],
+            if chat not in chats:
 
-        "hash": profile_hash(
-            user
-        ),
+                chats.append(
+                    chat
+                )
 
-        "overall": result["overall"],
-        "rank": result["rank"],
+        db[uid] = {
+            "id": user["id"],
+            "username": user["username"],
+            "name": user["name"],
+            "bio": user["bio"],
+            "photo": user["photo"],
+            "avatar_hash": user["avatar_hash"],
+            "hash": profile_hash(user),
 
-        "nick_score": result["nick_score"],
-        "avatar_score": result["avatar_score"],
-        "bio_score": result["bio_score"],
+            "overall": data["overall"],
+            "rank": data["rank"],
 
-        "chats": chats
-    }
+            "nick_score": data["nick_score"],
+            "avatar_score": data["avatar_score"],
+            "bio_score": data["bio_score"],
 
-    save_db()
+            "nick_text": data.get(
+                "nick_text",
+                ""
+            ),
+
+            "avatar_text": data.get(
+                "avatar_text",
+                ""
+            ),
+
+            "bio_text": data.get(
+                "bio_text",
+                ""
+            ),
+
+            "chats": chats,
+
+            "updated": int(
+                time.time()
+            )
+        }
+
+        save_db()
 
 
-# =========================================================
+# ============================================================
 # BREAKDOWN
-# =========================================================
+# ============================================================
 
-def breakdown(
+def make_breakdown(
     number,
     user,
     data
 ):
 
+    username = (
+        user["username"]
+        or user["name"]
+        or "unknown"
+    )
+
     return (
-        f"👤 Игрок {number}: "
-        f"@{user['username'] or 'без username'}\n"
+        f"👤 ИГРОК {number}: @{username}\n"
         f"🏆 {data['rank']} — "
         f"{data['overall']:.1f}/10\n\n"
 
         f"🔹 НИК — {data['nick_score']:.1f}/10\n"
-        f"{data['nick_text']}\n\n"
+        f"{data.get('nick_text', '')}\n\n"
 
         f"🔹 АВАТАР — {data['avatar_score']:.1f}/10\n"
-        f"{data['avatar_text']}\n\n"
+        f"{data.get('avatar_text', '')}\n\n"
 
         f"🔹 BIO — {data['bio_score']:.1f}/10\n"
-        f"{data['bio_text']}"
+        f"{data.get('bio_text', '')}"
     )
 
 
-# =========================================================
-# .мог
-# =========================================================
+# ============================================================
+# .МOG
+# ============================================================
 
 @client.on(
     events.NewMessage(
         pattern=r"^\.мог(?:\s+(\S+))?(?:\s+(\S+))?\s*$"
     )
 )
-async def mog(event):
+async def mog_handler(event):
 
     first = event.pattern_match.group(1)
     second = event.pattern_match.group(2)
@@ -1018,7 +1327,7 @@ async def mog(event):
     if not first:
 
         await event.reply(
-            "Использование:\n\n"
+            "Использование:\n"
             "`.мог @user`\n"
             "`.мог @user1 @user2`"
         )
@@ -1026,60 +1335,144 @@ async def mog(event):
         return
 
     status = await event.reply(
-        "⚖️ Судья анализирует ник, аватар и Bio..."
+        "⚡ Быстрый анализ..."
     )
-
-    sender = await event.get_sender()
-
-    if not second:
-
-        if sender.username:
-
-            second = (
-                "@"
-                + sender.username
-            )
-
-        else:
-
-            second = sender.id
-
-    u1 = await get_user(
-        first
-    )
-
-    u2 = await get_user(
-        second
-    )
-
-    if not u1 or not u2:
-
-        await status.edit(
-            "❌ Не удалось получить один из профилей."
-        )
-
-        return
 
     try:
 
-        result = await ai_compare(
+        sender = await event.get_sender()
+
+        if not second:
+
+            if sender.username:
+
+                second = (
+                    "@"
+                    +
+                    sender.username
+                )
+
+            else:
+
+                second = sender.id
+
+        # ====================================================
+        # Telegram: оба пользователя одновременно.
+        # ====================================================
+
+        u1, u2 = await get_two_users(
+            first,
+            second
+        )
+
+        if not u1 or not u2:
+
+            await status.edit(
+                "❌ Не удалось получить профиль."
+            )
+
+            return
+
+        # ====================================================
+        # Проверяем кэш пары.
+        # ====================================================
+
+        p_hash = pair_hash(
             u1,
             u2
         )
 
-        save_rating(
-            u1,
-            result["u1"],
-            event.chat_id
+        cached_pair = db.get(
+            "_pairs",
+            {}
         )
 
-        save_rating(
-            u2,
-            result["u2"],
-            event.chat_id
+        cached = cached_pair.get(
+            p_hash
         )
 
-        card = make_card(
+        if cached:
+
+            age = (
+                time.time()
+                -
+                cached.get(
+                    "created",
+                    0
+                )
+            )
+
+            if age < CACHE_TTL:
+
+                print(
+                    "[CACHE] pair hit"
+                )
+
+                result = cached["result"]
+
+            else:
+
+                cached = None
+
+        # ====================================================
+        # Gemini только если нет кэша.
+        # ====================================================
+
+        if not cached:
+
+            print(
+                "[AI] analyzing pair..."
+            )
+
+            contents = build_ai_content(
+                u1,
+                u2
+            )
+
+            result = await call_gemini(
+                contents
+            )
+
+            result = normalize_result(
+                result
+            )
+
+            if "_pairs" not in db:
+
+                db["_pairs"] = {}
+
+            db["_pairs"][p_hash] = {
+                "result": result,
+                "created": int(
+                    time.time()
+                )
+            }
+
+            save_db()
+
+        # ====================================================
+        # Сохраняем рейтинги.
+        # ====================================================
+
+        await asyncio.gather(
+            save_user_rating(
+                u1,
+                result["u1"],
+                event.chat_id
+            ),
+            save_user_rating(
+                u2,
+                result["u2"],
+                event.chat_id
+            )
+        )
+
+        # ====================================================
+        # Карточка.
+        # ====================================================
+
+        card = await asyncio.to_thread(
+            make_card,
             u1,
             u2,
             result
@@ -1115,8 +1508,12 @@ async def mog(event):
             caption=caption
         )
 
+        # ====================================================
+        # Полный разбор.
+        # ====================================================
+
         text = (
-            breakdown(
+            make_breakdown(
                 1,
                 u1,
                 result["u1"]
@@ -1124,7 +1521,7 @@ async def mog(event):
             +
             "\n\n"
             +
-            breakdown(
+            make_breakdown(
                 2,
                 u2,
                 result["u2"]
@@ -1146,141 +1543,211 @@ async def mog(event):
     except Exception as e:
 
         print(
-            "MOG ERROR:",
+            "[MOG ERROR]",
             repr(e)
         )
 
-        await status.edit(
-            "❌ Ошибка AI. Проверь GEMINI_API_KEY и попробуй ещё раз."
-        )
+        try:
+
+            await status.edit(
+                "❌ Ошибка при анализе. Попробуй ещё раз."
+            )
+
+        except:
+            pass
 
 
-# =========================================================
-# .хелп
-# =========================================================
+# ============================================================
+# .ХЕЛП
+# ============================================================
 
 @client.on(
     events.NewMessage(
         pattern=r"^\.хелп(?:\s+(\S+))?\s*$"
     )
 )
-async def help_command(event):
+async def help_handler(event):
 
     target = event.pattern_match.group(1)
 
-    if target:
+    msg = await event.reply(
+        "⚡ Анализирую профиль..."
+    )
 
-        user = await get_user(
-            target
-        )
+    try:
 
-    else:
-
-        sender = await event.get_sender()
-
-        if sender.username:
+        if target:
 
             user = await get_user(
-                "@"
-                + sender.username
+                target
             )
 
         else:
 
-            user = await get_user(
-                sender.id
+            sender = await event.get_sender()
+
+            if sender.username:
+
+                user = await get_user(
+                    "@"
+                    +
+                    sender.username
+                )
+
+            else:
+
+                user = await get_user(
+                    sender.id
+                )
+
+        if not user:
+
+            await msg.edit(
+                "❌ Профиль не найден."
             )
 
-    if not user:
+            return
 
-        await event.reply(
-            "❌ Не удалось получить профиль."
+        # ====================================================
+        # Ищем существующий профильный кэш.
+        # ====================================================
+
+        uid = str(
+            user["id"]
         )
 
-        return
+        cached = db.get(
+            uid
+        )
 
-    msg = await event.reply(
-        "🧠 Анализирую профиль..."
-    )
+        current_hash = profile_hash(
+            user
+        )
 
-    prompt = f"""
-Ты консультант по Telegram-профилям.
+        if cached:
+
+            if (
+                cached.get("hash")
+                ==
+                current_hash
+            ):
+
+                cached_help = cached.get(
+                    "help"
+                )
+
+                if cached_help:
+
+                    print(
+                        "[CACHE] help hit"
+                    )
+
+                    await msg.edit(
+                        "🧠 РАЗБОР ПРОФИЛЯ\n\n"
+                        +
+                        cached_help
+                    )
+
+                    return
+
+        # ====================================================
+        # AI.
+        # ====================================================
+
+        prompt = f"""
+Ты серьёзный консультант по Telegram-профилям.
 
 Оцени ТОЛЬКО:
 - username / ник
 - аватар
 - Bio
 
-Не обсуждай возраст, пол, национальность,
-внешность человека или личные качества.
+Не обсуждай:
+- возраст
+- пол
+- национальность
+- внешность человека
+- личные качества.
 
-Username: @{user["username"]}
-Имя: {user["name"]}
-Bio: {user["bio"]}
+Username:
+@{user["username"]}
 
-Дай конкретный разбор:
+Имя:
+{user["name"]}
+
+Bio:
+{user["bio"]}
+
+Дай короткий, конкретный и полезный совет:
 
 1. Что уже хорошо.
-2. Главные проблемы.
+2. Что плохо.
 3. Как улучшить ник.
 4. Как улучшить аватар.
 5. Как улучшить Bio.
-6. Три конкретных действия для улучшения профиля.
+6. Три конкретных действия.
 
 Стиль: серьёзный, нейтральный, конструктивный.
+Без лишней воды.
 """
 
-    contents = [
-        prompt
-    ]
+        contents = [
+            prompt
+        ]
 
-    if user["photo"]:
+        image_data = prepare_avatar(
+            user.get("photo")
+        )
 
-        try:
-
-            buffer = io.BytesIO()
-
-            Image.open(
-                user["photo"]
-            ).convert(
-                "RGB"
-            ).save(
-                buffer,
-                "JPEG",
-                quality=90
-            )
+        if image_data:
 
             contents.append(
                 types.Part.from_bytes(
-                    data=buffer.getvalue(),
+                    data=image_data,
                     mime_type="image/jpeg"
                 )
             )
 
-        except:
-            pass
-
-    try:
-
-        response = await asyncio.to_thread(
-            ai.models.generate_content,
-            model=MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                temperature=0.25
-            )
+        answer = await call_help_ai(
+            contents
         )
+
+        # ====================================================
+        # Сохраняем кэш.
+        # ====================================================
+
+        async with db_lock:
+
+            if uid not in db:
+
+                db[uid] = {}
+
+            db[uid].update({
+                "id": user["id"],
+                "username": user["username"],
+                "name": user["name"],
+                "bio": user["bio"],
+                "photo": user["photo"],
+                "avatar_hash": user["avatar_hash"],
+                "hash": current_hash,
+                "help": answer,
+                "help_updated": int(
+                    time.time()
+                )
+            })
+
+            save_db()
 
         await msg.edit(
             "🧠 РАЗБОР ПРОФИЛЯ\n\n"
             +
-            response.text
+            answer
         )
 
     except Exception as e:
 
         print(
-            "HELP ERROR:",
+            "[HELP ERROR]",
             repr(e)
         )
 
@@ -1289,34 +1756,79 @@ Bio: {user["bio"]}
         )
 
 
-# =========================================================
-# TOP
-# =========================================================
+# ============================================================
+# HELP AI
+# ============================================================
+
+async def call_help_ai(
+    contents
+):
+
+    response = await asyncio.to_thread(
+        ai.models.generate_content,
+        model=GEMINI_MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            temperature=0.15,
+            max_output_tokens=700
+        )
+    )
+
+    return response.text.strip()
+
+
+# ============================================================
+# .ТОП
+# ============================================================
 
 @client.on(
     events.NewMessage(
         pattern=r"^\.топ(?:\s+(все|чат|чата))?\s*$"
     )
 )
-async def top(event):
+async def top_handler(event):
 
     mode = event.pattern_match.group(1)
 
+    if mode == "все":
+
+        title = "🌍 ТОП ВСЕХ"
+
+    else:
+
+        title = "🏠 ТОП ЧАТА"
+
     users = []
 
-    for user in db.values():
+    for key, user in db.items():
+
+        if key == "_pairs":
+            continue
+
+        if not isinstance(
+            user,
+            dict
+        ):
+            continue
 
         if mode != "все":
 
-            if str(event.chat_id) not in [
+            chats = [
                 str(x)
                 for x in user.get(
                     "chats",
                     []
                 )
-            ]:
+            ]
+
+            if str(
+                event.chat_id
+            ) not in chats:
 
                 continue
+
+        if "overall" not in user:
+            continue
 
         users.append(
             user
@@ -1342,14 +1854,6 @@ async def top(event):
 
         return
 
-    if mode == "все":
-
-        title = "🌍 ТОП ВСЕХ"
-
-    else:
-
-        title = "🏠 ТОП ЧАТА"
-
     lines = [
         title,
         ""
@@ -1368,7 +1872,7 @@ async def top(event):
 
         lines.append(
             f"{i}. @{name} — "
-            f"{float(user.get('overall', 0)):.1f}/10 "
+            f"{float(user['overall']):.1f}/10 "
             f"({user.get('rank', 'Sub-3')})"
         )
 
@@ -1377,16 +1881,16 @@ async def top(event):
     )
 
 
-# =========================================================
-# .ранги
-# =========================================================
+# ============================================================
+# .РАНГИ
+# ============================================================
 
 @client.on(
     events.NewMessage(
         pattern=r"^\.ранги$"
     )
 )
-async def ranks(event):
+async def ranks_handler(event):
 
     await event.reply(
         "🏆 РАНГИ\n\n"
@@ -1400,37 +1904,52 @@ async def ranks(event):
     )
 
 
-# =========================================================
-# .команды
-# =========================================================
+# ============================================================
+# .КОМАНДЫ
+# ============================================================
 
 @client.on(
     events.NewMessage(
         pattern=r"^\.команды$"
     )
 )
-async def commands(event):
+async def commands_handler(event):
 
     await event.reply(
         "📚 КОМАНДЫ\n\n"
-        "`.мог @user` — сравнение с тобой\n"
-        "`.мог @user1 @user2` — сравнение двух\n\n"
-        "`.хелп` — совет по своему профилю\n"
-        "`.хелп @user` — совет по профилю\n\n"
-        "`.топ` — топ текущего чата\n"
-        "`.топ все` — общий топ\n\n"
-        "`.ранги` — система рангов\n"
-        "`.команды` — список команд"
+
+        "`.мог @user`\n"
+        "Сравнить пользователя с тобой.\n\n"
+
+        "`.мог @user1 @user2`\n"
+        "Сравнить двух пользователей.\n\n"
+
+        "`.хелп`\n"
+        "Получить советы по своему профилю.\n\n"
+
+        "`.хелп @user`\n"
+        "Получить советы для другого профиля.\n\n"
+
+        "`.топ`\n"
+        "Топ текущего чата.\n\n"
+
+        "`.топ все`\n"
+        "Общий топ.\n\n"
+
+        "`.ранги`\n"
+        "Система рангов."
     )
 
 
-# =========================================================
+# ============================================================
 # START
-# =========================================================
+# ============================================================
 
 async def main():
 
-    print("Starting bot...")
+    print(
+        "[BOT] Starting..."
+    )
 
     await client.start(
         bot_token=BOT_TOKEN
@@ -1439,16 +1958,22 @@ async def main():
     me = await client.get_me()
 
     print(
-        "Logged in:",
+        "[BOT] Logged in:",
         "@"
-        + (
+        +
+        (
             me.username
             or str(me.id)
         )
     )
 
     print(
-        "BOT READY"
+        "[BOT] MODEL:",
+        GEMINI_MODEL
+    )
+
+    print(
+        "[BOT] READY"
     )
 
     await client.run_until_disconnected()
@@ -1458,4 +1983,4 @@ if __name__ == "__main__":
 
     asyncio.run(
         main()
-        )
+    )
