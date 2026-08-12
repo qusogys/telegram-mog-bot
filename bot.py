@@ -5,9 +5,12 @@ import secrets
 import threading
 from time import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from types import SimpleNamespace
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -23,9 +26,19 @@ from telegram.ext import (
 # =========================================================
 
 TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
-DB_PATH = os.getenv("DB_PATH", "economy.db")
+try:
+    OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+except ValueError:
+    OWNER_ID = 0
+
+# Для Render Persistent Disk:
+# Mount Path: /var/data
+DB_PATH = os.getenv(
+    "DB_PATH",
+    "/var/data/economy.db"
+)
+
 PORT = int(os.getenv("PORT", "10000"))
 
 START_BALANCE = 10_000
@@ -35,18 +48,34 @@ BONUS_COOLDOWN = 4 * 60 * 60  # 4 часа
 
 
 # =========================================================
+# СОЗДАЁМ ПАПКУ ДЛЯ БАЗЫ
+# =========================================================
+
+db_dir = os.path.dirname(DB_PATH)
+
+if db_dir:
+    os.makedirs(
+        db_dir,
+        exist_ok=True
+    )
+
+
+# =========================================================
 # РУЛЕТКА
 # =========================================================
 
-# Это числа "ақ" — бывшие красные.
-RED_NUMBERS = {
+# В нашем боте:
+# ⚪ = ақ
+# ⚫ = қара
+# 🟢 = 0
+
+WHITE_NUMBERS = {
     1, 3, 5, 7, 9,
     12, 14, 16, 18,
     19, 21, 23, 25, 27,
     30, 32, 34, 36
 }
 
-# Последние 20 результатов.
 roulette_history = []
 
 
@@ -58,14 +87,20 @@ mines_games = {}
 
 
 # =========================================================
-# БАЗА
+# БЛОКИРОВКА БАЗЫ
 # =========================================================
 
 DB_LOCK = threading.RLock()
 
+
+# =========================================================
+# SQLITE
+# =========================================================
+
 db = sqlite3.connect(
     DB_PATH,
-    check_same_thread=False
+    check_same_thread=False,
+    timeout=30
 )
 
 db.row_factory = sqlite3.Row
@@ -73,6 +108,12 @@ db.row_factory = sqlite3.Row
 with DB_LOCK:
 
     db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=NORMAL")
+    db.execute("PRAGMA foreign_keys=ON")
+
+    # -------------------------
+    # Пользователи
+    # -------------------------
 
     db.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -84,6 +125,10 @@ with DB_LOCK:
         )
     """)
 
+    # -------------------------
+    # Промокоды
+    # -------------------------
+
     db.execute("""
         CREATE TABLE IF NOT EXISTS promo_codes (
             code TEXT PRIMARY KEY,
@@ -94,6 +139,10 @@ with DB_LOCK:
         )
     """)
 
+    # -------------------------
+    # Использованные промокоды
+    # -------------------------
+
     db.execute("""
         CREATE TABLE IF NOT EXISTS promo_uses (
             code TEXT NOT NULL,
@@ -102,7 +151,38 @@ with DB_LOCK:
         )
     """)
 
+    # -------------------------
+    # История рулетки
+    # -------------------------
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS roulette_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            number INTEGER NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+    """)
+
     db.commit()
+
+
+# =========================================================
+# ЗАГРУЗКА ИСТОРИИ РУЛЕТКИ
+# =========================================================
+
+with DB_LOCK:
+
+    rows = db.execute("""
+        SELECT number
+        FROM roulette_history
+        ORDER BY id DESC
+        LIMIT 20
+    """).fetchall()
+
+    roulette_history = [
+        int(row["number"])
+        for row in reversed(rows)
+    ]
 
 
 # =========================================================
@@ -145,16 +225,15 @@ def parse_amount(value):
         raise ValueError
 
     number = float(match.group(1))
+
     suffix = match.group(2) or ""
 
     multipliers = {
         "": 1,
         "к": 1_000,
         "k": 1_000,
-
         "кк": 1_000_000,
         "kk": 1_000_000,
-
         "м": 1_000_000,
         "млн": 1_000_000,
     }
@@ -169,7 +248,12 @@ def parse_amount(value):
     return amount
 
 
+# =========================================================
+# ПОЛЬЗОВАТЕЛЬ
+# =========================================================
+
 def ensure_user(user):
+
     with DB_LOCK:
 
         db.execute(
@@ -190,7 +274,7 @@ def ensure_user(user):
             (
                 user.id,
                 user.username,
-                user.first_name,
+                user.first_name or "",
                 START_BALANCE,
             )
         )
@@ -222,10 +306,6 @@ def get_balance(user_id):
 # =========================================================
 
 def debit(user_id, amount):
-    """
-    Атомарное списание.
-    Баланс никогда не уйдет ниже нуля.
-    """
 
     if amount <= 0:
         return False
@@ -280,9 +360,6 @@ def transfer_money(
     receiver_id,
     amount
 ):
-    """
-    Атомарный перевод.
-    """
 
     if amount <= 0:
         return False
@@ -348,7 +425,7 @@ def transfer_money(
 
 
 # =========================================================
-# РУЛЕТКА
+# РУЛЕТКА — СТАВКА
 # =========================================================
 
 def parse_bet(value):
@@ -361,8 +438,6 @@ def parse_bet(value):
         "а",
         "ак",
         "white",
-        "қызыл",
-        "кызыл",
     }:
         return (
             "color",
@@ -385,7 +460,6 @@ def parse_bet(value):
     # Жұп
     if value in {
         "жұп",
-        "жуп",
         "чет",
         "even",
     }:
@@ -451,41 +525,32 @@ def parse_bet(value):
     return None
 
 
+# =========================================================
+# РУЛЕТКА — КОЭФФИЦИЕНТ
+# =========================================================
+
 def roulette_multiplier(
     kind,
     value
 ):
-    """
-    Коэффициенты:
 
-    Точное число:
-        0 -> 100x
-        остальные -> 36x
-
-    Ақ / Қара:
-        2x
-
-    Жұп / Тақ:
-        2x
-
-    Диапазон:
-        рассчитывается от размера диапазона
-        с небольшим house edge.
-    """
-
+    # 0
     if kind == "number":
 
         if value == 0:
-            return 100
+            return 100.0
 
-        return 36
+        return 36.0
 
+    # Ақ / Қара
     if kind == "color":
-        return 2
+        return 1.90
 
+    # Жұп / Тақ
     if kind == "parity":
-        return 2
+        return 1.90
 
+    # Диапазон
     if kind == "range":
 
         count = (
@@ -494,20 +559,27 @@ def roulette_multiplier(
             + 1
         )
 
+        # Небольшое преимущество бота.
         multiplier = (
-            37 / count
+            36 / count
         ) * 0.95
 
+        # Не позволяем диапазону
+        # давать огромные выплаты.
         return max(
             1.01,
             min(
-                35,
+                35.0,
                 multiplier
             )
         )
 
-    return 1
+    return 1.0
 
+
+# =========================================================
+# РУЛЕТКА — ПРОВЕРКА ПОБЕДЫ
+# =========================================================
 
 def roulette_win(
     kind,
@@ -529,18 +601,18 @@ def roulette_win(
 
     if kind == "color":
 
+        # 0 зелёный и не считается
+        # ни ақ, ни қара.
         if result == 0:
             return False
 
         result_color = (
             "white"
-            if result in RED_NUMBERS
+            if result in WHITE_NUMBERS
             else "black"
         )
 
-        return (
-            result_color == value
-        )
+        return result_color == value
 
     if kind == "parity":
 
@@ -553,12 +625,14 @@ def roulette_win(
             else "odd"
         )
 
-        return (
-            result_parity == value
-        )
+        return result_parity == value
 
     return False
 
+
+# =========================================================
+# РУЛЕТКА — НАЗВАНИЕ СТАВКИ
+# =========================================================
 
 def roulette_bet_name(
     kind,
@@ -591,70 +665,103 @@ def roulette_bet_name(
     return "?"
 
 
+# =========================================================
+# РУЛЕТКА — РЕЗУЛЬТАТ
+# =========================================================
+
 def roulette_result_text(number):
 
     if number == 0:
-
         return "🟢 0"
 
-    if number in RED_NUMBERS:
-
+    if number in WHITE_NUMBERS:
         return f"⚪ {number}"
 
     return f"⚫ {number}"
 
 
+# =========================================================
+# ДОБАВЛЕНИЕ В ИСТОРИЮ
+# =========================================================
+
 def add_roulette_history(number):
 
-    roulette_history.append(
-        number
-    )
+    global roulette_history
 
-    if len(
-        roulette_history
-    ) > 20:
+    with DB_LOCK:
+
+        db.execute(
+            """
+            INSERT INTO roulette_history (
+                number,
+                created_at
+            )
+            VALUES (?, ?)
+            """,
+            (
+                number,
+                now()
+            )
+        )
+
+        # Оставляем в базе только последние 20.
+        db.execute(
+            """
+            DELETE FROM roulette_history
+            WHERE id NOT IN (
+                SELECT id
+                FROM roulette_history
+                ORDER BY id DESC
+                LIMIT 20
+            )
+            """
+        )
+
+        db.commit()
+
+    roulette_history.append(number)
+
+    if len(roulette_history) > 20:
 
         del roulette_history[:-20]
 
+
+# =========================================================
+# ИСТОРИЯ РУЛЕТКИ
+# =========================================================
 
 def roulette_history_text():
 
     if not roulette_history:
 
         return (
-            "📜 Әзірге рулетка "
-            "нәтижелері жоқ."
+            "📜 РУЛЕТКАНЫҢ ТАРИХЫ\n\n"
+            "Әзірге нәтиже жоқ."
         )
 
-    results = [
-        roulette_result_text(number)
-        for number in roulette_history
-    ]
+    results = []
+
+    for number in roulette_history:
+
+        results.append(
+            roulette_result_text(number)
+        )
 
     return (
         "📜 РУЛЕТКАНЫҢ СОҢҒЫ "
-        "20 НӘТИЖЕСІ\n\n"
+        f"{len(results)} НӘТИЖЕСІ\n\n"
         + "  ".join(results)
     )
 
 
 # =========================================================
-# МИНЫ
+# МИНЫ — КОЭФФИЦИЕНТ
 # =========================================================
 
 def mines_multiplier(
     safe_opened,
     mine_count
 ):
-    """
-    Fair-ish Mines коэффициенті.
-
-    Әр ашылған ұяшықтың ықтималдығына
-    сүйеніп есептеледі.
-
-    0.96 house factor экономикаға
-    шағын қорғаныс береді.
-    """
 
     if safe_opened <= 0:
         return 1.0
@@ -663,26 +770,44 @@ def mines_multiplier(
         25 - mine_count
     )
 
+    if safe_opened > safe_total:
+        return 1.0
+
     multiplier = 1.0
 
-    for k in range(
-        safe_opened
+    # Небольшой house edge.
+    house_factor = 0.97
+
+    for step in range(
+        1,
+        safe_opened + 1
     ):
 
         probability = (
-            (safe_total - k)
-            / (25 - k)
+            (safe_total - step + 1)
+            /
+            (26 - step)
         )
 
         multiplier *= (
-            1 / probability
-        ) * 0.96
+            probability
+            and (
+                1 / probability
+            )
+            or 1
+        )
+
+        multiplier *= house_factor
 
     return max(
         1.01,
         multiplier
     )
 
+
+# =========================================================
+# МИНЫ — КНОПКИ
+# =========================================================
 
 def mines_board(
     game,
@@ -696,25 +821,20 @@ def mines_board(
         if reveal:
 
             if index in game["mines"]:
-
                 text = "💣"
 
             elif index in game["opened"]:
-
                 text = "💎"
 
             else:
-
                 text = "🟩"
 
         else:
 
             if index in game["opened"]:
-
                 text = "💎"
 
             else:
-
                 text = "⬜"
 
         buttons.append(
@@ -739,17 +859,15 @@ def mines_board(
 
     if not reveal:
 
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    "💰 Ұтысты алу",
-                    callback_data=(
-                        f"cash:"
-                        f"{game['user_id']}"
-                    )
+        rows.append([
+            InlineKeyboardButton(
+                "💰 Ұтысты алу",
+                callback_data=(
+                    f"cash:"
+                    f"{game['user_id']}"
                 )
-            ]
-        )
+            )
+        ])
 
     return InlineKeyboardMarkup(
         rows
@@ -773,33 +891,41 @@ async def start(
         "🇰🇿 Сәлем!\n\n"
         "💰 Теңге экономика ботына "
         "қош келдің!\n\n"
+
         f"💵 Бастапқы баланс: "
         f"{format_money(START_BALANCE)} ₸\n"
-        f"🎁 Бонус: "
-        f"{format_money(BONUS_AMOUNT)} ₸ / 4 сағат\n\n"
 
-        "💰 Баланс:\n"
+        f"🎁 Бонус: "
+        f"{format_money(BONUS_AMOUNT)} ₸ "
+        f"/ 4 сағат\n\n"
+
+        "💰 БАЛАНС\n"
         "баланс / б / бал / ақша\n\n"
 
-        "🎁 Бонус:\n"
+        "🎁 БОНУС\n"
         "бонус / bonus / сыйлық\n\n"
 
-        "🎰 Рулетка:\n"
+        "🎰 РУЛЕТКА\n"
         "2000 ақ\n"
         "2000 а\n"
         "2000 қара\n"
         "2000 қ\n"
         "2000 16\n"
-        "2000 16-30\n\n"
+        "2000 16-30\n"
+        "2000 жұп\n"
+        "2000 тақ\n\n"
 
-        "💣 Мины:\n"
+        "💣 МИНЫ\n"
         "мины 1000\n"
         "мины 1000 5\n\n"
 
-        "💸 Аударым:\n"
-        "reply жасап: бер 5000\n"
+        "💸 АУДАРЫМ\n"
+        "Reply жасап: бер 5к\n"
         "бер 5к @username\n"
-        "бер 5к ID"
+        "бер 5к ID\n\n"
+
+        "🎟️ ПРОМО\n"
+        "/promo CODE"
     )
 
 
@@ -812,16 +938,16 @@ async def balance_command(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    ensure_user(
-        update.effective_user
-    )
+    user = update.effective_user
+
+    ensure_user(user)
 
     balance = get_balance(
-        update.effective_user.id
+        user.id
     )
 
     await update.message.reply_text(
-        "💰 Балансың:\n"
+        "💰 БАЛАНСЫҢ\n\n"
         f"{format_money(balance)} ₸"
     )
 
@@ -856,7 +982,8 @@ async def bonus_command(
 
         remaining = (
             BONUS_COOLDOWN
-            - (
+            -
+            (
                 now()
                 - last_bonus
             )
@@ -865,18 +992,17 @@ async def bonus_command(
         if remaining > 0:
 
             hours = (
-                remaining
-                // 3600
+                remaining // 3600
             )
 
             minutes = (
-                remaining
-                % 3600
+                remaining % 3600
             ) // 60
 
             await update.message.reply_text(
                 "⏳ Бонус әлі дайын емес.\n\n"
-                f"Қалғаны: {hours} сағ "
+                f"Қалғаны: "
+                f"{hours} сағ "
                 f"{minutes} мин."
             )
 
@@ -900,7 +1026,7 @@ async def bonus_command(
         db.commit()
 
     await update.message.reply_text(
-        "🎁 Бонус алынды!\n\n"
+        "🎁 БОНУС АЛЫНДЫ!\n\n"
         f"+{format_money(BONUS_AMOUNT)} ₸\n\n"
         "⏰ Келесі бонус "
         "4 сағаттан кейін."
@@ -917,7 +1043,7 @@ async def help_command(
 ):
 
     await update.message.reply_text(
-        "🇰🇿 КӨМЕК\n\n"
+        "🇰🇿 КОМАНДАЛАР\n\n"
 
         "💰 Баланс:\n"
         "баланс / б / бал / ақша\n\n"
@@ -925,11 +1051,6 @@ async def help_command(
         "🎁 Бонус:\n"
         "бонус / bonus / сыйлық\n"
         "Әр 4 сағат сайын.\n\n"
-
-        "💸 Аударым:\n"
-        "Reply жасап: бер 5к\n"
-        "бер 5к @username\n"
-        "бер 5к 123456789\n\n"
 
         "🎰 Рулетка:\n"
         "2000 ақ\n"
@@ -945,18 +1066,26 @@ async def help_command(
         "мины 1000\n"
         "мины 1000 5\n\n"
 
+        "💸 Аударым:\n"
+        "Reply жасап: бер 5к\n"
+        "бер 5к @username\n"
+        "бер 5к 123456789\n\n"
+
         "📜 Рулетка тарихы:\n"
-        "тарих\n"
-        "/history\n\n"
+        "тарих / history\n\n"
 
         "🎟️ Промокод:\n"
         "/promo gift1\n\n"
 
-        "🔢 Сомалар:\n"
-        "3к = 3 000\n"
-        "30к = 30 000\n"
-        "3кк = 3 000 000\n"
-        "2.5кк = 2 500 000"
+        "👑 Создание промокода:\n"
+        "/createp gift1 20 30к\n\n"
+
+        "🔢 СОМАЛАР:\n"
+        "3000\n"
+        "3к\n"
+        "30к\n"
+        "3кк\n"
+        "2.5кк"
     )
 
 
@@ -997,7 +1126,7 @@ async def transfer_command(
         await update.message.reply_text(
             "❌ Алушы табылмады.\n\n"
             "Мысал:\n"
-            "• reply жасап: бер 5к\n"
+            "• Reply жасап: бер 5к\n"
             "• бер 5к @username\n"
             "• бер 5к ID"
         )
@@ -1033,65 +1162,11 @@ async def transfer_command(
         return
 
     await update.message.reply_text(
-        "💸 Аударым орындалды!\n\n"
+        "💸 АУДАРЫМ ОРЫНДАЛДЫ!\n\n"
         f"Сома: "
         f"{format_money(amount)} ₸\n"
         f"Кімге: "
-        f"{target_user.first_name}"
-    )
-
-
-# =========================================================
-# ПОИСК ПОЛЬЗОВАТЕЛЯ
-# =========================================================
-
-def find_user_by_username(
-    username
-):
-
-    username = (
-        username
-        .lower()
-        .lstrip("@")
-    )
-
-    with DB_LOCK:
-
-        return db.execute(
-            """
-            SELECT *
-            FROM users
-            WHERE lower(username) = ?
-            """,
-            (username,)
-        ).fetchone()
-
-
-def find_user_by_id(
-    user_id
-):
-
-    with DB_LOCK:
-
-        return db.execute(
-            """
-            SELECT *
-            FROM users
-            WHERE user_id = ?
-            """,
-            (user_id,)
-        ).fetchone()
-
-
-def row_to_user(row):
-
-    if not row:
-        return None
-
-    return SimpleNamespace(
-        id=row["user_id"],
-        username=row["username"],
-        first_name=row["first_name"]
+        f"{target_user.first_name or 'пайдаланушы'}"
     )
 
 
@@ -1104,10 +1179,7 @@ async def create_promo(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if (
-        update.effective_user.id
-        != OWNER_ID
-    ):
+    if update.effective_user.id != OWNER_ID:
 
         await update.message.reply_text(
             "❌ Бұл команда тек "
@@ -1129,8 +1201,22 @@ async def create_promo(
 
     code = (
         context.args[0]
+        .strip()
         .lower()
     )
+
+    if not re.fullmatch(
+        r"[a-zA-Z0-9_-]{1,50}",
+        code
+    ):
+
+        await update.message.reply_text(
+            "❌ Промокодта тек "
+            "латын әріптері, "
+            "сандар, _ және - болсын."
+        )
+
+        return
 
     try:
 
@@ -1143,9 +1229,7 @@ async def create_promo(
         )
 
         if not (
-            1
-            <= max_uses
-            <= 1_000_000
+            1 <= max_uses <= 1_000_000
         ):
             raise ValueError
 
@@ -1166,10 +1250,11 @@ async def create_promo(
                 INSERT INTO promo_codes (
                     code,
                     max_uses,
+                    used_count,
                     amount,
                     created_at
                 )
-                VALUES (?, ?, ?, ?)
+                VALUES (?, ?, 0, ?, ?)
                 """,
                 (
                     code,
@@ -1191,9 +1276,9 @@ async def create_promo(
             return
 
     await update.message.reply_text(
-        "✅ Промокод жасалды!\n\n"
+        "✅ ПРОМОКОД ЖАСАЛДЫ!\n\n"
         f"🎟️ Код: {code}\n"
-        f"👥 Активаций: {max_uses}\n"
+        f"👥 Активация: {max_uses}\n"
         f"💰 Сыйлық: "
         f"{format_money(amount)} ₸"
     )
@@ -1223,6 +1308,7 @@ async def use_promo(
 
     code = (
         context.args[0]
+        .strip()
         .lower()
     )
 
@@ -1331,7 +1417,7 @@ async def use_promo(
             return
 
     await update.message.reply_text(
-        "🎁 Промокод қабылданды!\n\n"
+        "🎁 ПРОМОКОД ҚАБЫЛДАНДЫ!\n\n"
         f"+{format_money(promo['amount'])} ₸"
     )
 
@@ -1341,7 +1427,7 @@ async def use_promo(
 # =========================================================
 
 async def play_roulette(
-    update,
+    update: Update,
     amount_text,
     bet_text
 ):
@@ -1358,10 +1444,6 @@ async def play_roulette(
 
     except ValueError:
 
-        await update.message.reply_text(
-            "❌ Сома қате."
-        )
-
         return
 
     bet = parse_bet(
@@ -1369,20 +1451,12 @@ async def play_roulette(
     )
 
     if not bet:
-
-        await update.message.reply_text(
-            "❌ Ставка түсініксіз.\n\n"
-            "Мысал:\n"
-            "2000 ақ\n"
-            "2000 16\n"
-            "2000 16-30"
-        )
-
         return
 
     kind, value = bet
 
-    # Защита экономики для 100x.
+    # 0 ограничиваем,
+    # чтобы 100x не разрушал экономику.
     if (
         kind == "number"
         and value == 0
@@ -1396,6 +1470,7 @@ async def play_roulette(
 
         return
 
+    # Сначала списываем.
     if not debit(
         user.id,
         amount
@@ -1411,7 +1486,7 @@ async def play_roulette(
 
         return
 
-    # Рандом: 0-36.
+    # Криптографически случайное число.
     result = secrets.randbelow(37)
 
     add_roulette_history(
@@ -1429,6 +1504,11 @@ async def play_roulette(
         value
     )
 
+    bet_name = roulette_bet_name(
+        kind,
+        value
+    )
+
     if won:
 
         payout = int(
@@ -1440,13 +1520,14 @@ async def play_roulette(
             payout
         )
 
-        message = (
-            f"🎰 {roulette_result_text(result)}\n\n"
+        await update.message.reply_text(
+            f"🎰 РУЛЕТКА\n\n"
+            f"Нәтиже: "
+            f"{roulette_result_text(result)}\n\n"
             "🎉 ҰТЫС!\n\n"
             f"Ставка: "
             f"{format_money(amount)} ₸\n"
-            f"Таңдау: "
-            f"{roulette_bet_name(kind, value)}\n"
+            f"Таңдау: {bet_name}\n"
             f"Коэффициент: "
             f"{multiplier:.2f}x\n"
             f"Төлем: "
@@ -1456,24 +1537,25 @@ async def play_roulette(
 
     else:
 
-        message = (
-            f"🎰 {roulette_result_text(result)}\n\n"
-            "❌ Ұтылдың.\n\n"
+        await update.message.reply_text(
+            f"🎰 РУЛЕТКА\n\n"
+            f"Нәтиже: "
+            f"{roulette_result_text(result)}\n\n"
+            "❌ ҰТЫЛДЫҢ.\n\n"
             f"Ставка: "
             f"{format_money(amount)} ₸\n"
-            f"Таңдау: "
-            f"{roulette_bet_name(kind, value)}\n\n"
+            f"Таңдау: {bet_name}\n\n"
             f"{roulette_history_text()}"
         )
 
-    await update.message.reply_text(
-        message
-    )
 
+# =========================================================
+# ИСТОРИЯ
+# =========================================================
 
 async def history_command(
-    update,
-    context
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     await update.message.reply_text(
@@ -1482,19 +1564,15 @@ async def history_command(
 
 
 # =========================================================
-# МИНЫ — START
+# МИНЫ — СТАРТ
 # =========================================================
 
 async def start_mines(
-    update,
+    update: Update,
     parts
 ):
 
-    if len(parts) not in (
-        2,
-        3
-    ):
-
+    if len(parts) not in (2, 3):
         return False
 
     try:
@@ -1525,9 +1603,7 @@ async def start_mines(
         return True
 
     if not (
-        1
-        <= mine_count
-        <= 24
+        1 <= mine_count <= 24
     ):
 
         await update.message.reply_text(
@@ -1566,9 +1642,10 @@ async def start_mines(
 
         return True
 
-    # Случайно выбираем мины.
+    random_generator = secrets.SystemRandom()
+
     mine_positions = set(
-        secrets.SystemRandom().sample(
+        random_generator.sample(
             range(25),
             mine_count
         )
@@ -1596,7 +1673,7 @@ async def start_mines(
         f"💣 Миналар: "
         f"{mine_count}\n"
         "💎 Ашылғаны: 0\n"
-        "📈 Қазіргі коэффициент: 1.00x\n\n"
+        "📈 Коэффициент: 1.00x\n\n"
         "Ұяшықты таңда:",
         reply_markup=markup
     )
@@ -1605,35 +1682,39 @@ async def start_mines(
 
 
 # =========================================================
-# МИНЫ — CELL
+# МИНЫ — КЛЕТКА
 # =========================================================
 
 async def mines_callback(
-    update,
-    context
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     query = update.callback_query
 
     await query.answer()
 
-    _, user_id_text, index_text = (
-        query.data.split(":")
-    )
+    parts = query.data.split(":")
 
-    user_id = int(
-        user_id_text
-    )
+    if len(parts) != 3:
+        return
 
-    index = int(
-        index_text
-    )
+    try:
+
+        user_id = int(
+            parts[1]
+        )
+
+        index = int(
+            parts[2]
+        )
+
+    except ValueError:
+        return
 
     if (
-        query.from_user.id
-        != user_id
-        or user_id
-        not in mines_games
+        query.from_user.id != user_id
+        or user_id not in mines_games
     ):
 
         await query.answer(
@@ -1643,15 +1724,20 @@ async def mines_callback(
 
         return
 
-    game = mines_games[
-        user_id
-    ]
-
-    if index in game["opened"]:
-
+    if not (
+        0 <= index < 25
+    ):
         return
 
-    # Мина.
+    game = mines_games[user_id]
+
+    if index in game["opened"]:
+        return
+
+    # -------------------------
+    # МИНА
+    # -------------------------
+
     if index in game["mines"]:
 
         markup = mines_board(
@@ -1659,22 +1745,23 @@ async def mines_callback(
             reveal=True
         )
 
-        del mines_games[
-            user_id
-        ]
+        del mines_games[user_id]
 
         await query.edit_message_text(
             "💥 МИНА!\n\n"
             f"❌ Сен "
             f"{format_money(game['bet'])} ₸ "
-            "жоғалттың.\n\n"
+            f"жоғалттың.\n\n"
             "💣 МИНАЛАРДЫҢ ОРНАЛАСУЫ:",
             reply_markup=markup
         )
 
         return
 
-    # Қауіпсіз клетка.
+    # -------------------------
+    # БЕЗОПАСНАЯ КЛЕТКА
+    # -------------------------
+
     game["opened"].add(
         index
     )
@@ -1686,7 +1773,7 @@ async def mines_callback(
         - len(game["mines"])
     )
 
-    # Барлық қауіпсіз клеткалар ашылды.
+    # Все безопасные клетки.
     if game["safe"] >= safe_total:
 
         multiplier = mines_multiplier(
@@ -1709,13 +1796,11 @@ async def mines_callback(
             reveal=True
         )
 
-        del mines_games[
-            user_id
-        ]
+        del mines_games[user_id]
 
         await query.edit_message_text(
             "🏆 БАРЛЫҚ ҚАУІПСІЗ "
-            "КЛЕТКАЛАР АШЫЛДЫ!\n\n"
+            "ҰЯШЫҚТАР АШЫЛДЫ!\n\n"
             f"📈 Коэффициент: "
             f"{multiplier:.2f}x\n"
             f"💰 Ұтыс: "
@@ -1744,38 +1829,41 @@ async def mines_callback(
         f"{game['safe']}\n"
         f"📈 Коэффициент: "
         f"{multiplier:.2f}x\n\n"
-        "Жалғастыр немесе "
-        "ұтысты ал:",
+        "Жалғастыр немесе ұтысты ал:",
         reply_markup=markup
     )
 
 
 # =========================================================
-# МИНЫ — CASHOUT
+# МИНЫ — ЗАБРАТЬ
 # =========================================================
 
 async def mines_cash(
-    update,
-    context
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     query = update.callback_query
 
     await query.answer()
 
-    _, user_id_text = (
-        query.data.split(":")
-    )
+    parts = query.data.split(":")
 
-    user_id = int(
-        user_id_text
-    )
+    if len(parts) != 2:
+        return
+
+    try:
+
+        user_id = int(
+            parts[1]
+        )
+
+    except ValueError:
+        return
 
     if (
-        query.from_user.id
-        != user_id
-        or user_id
-        not in mines_games
+        query.from_user.id != user_id
+        or user_id not in mines_games
     ):
 
         await query.answer(
@@ -1785,9 +1873,7 @@ async def mines_cash(
 
         return
 
-    game = mines_games[
-        user_id
-    ]
+    game = mines_games[user_id]
 
     if game["safe"] <= 0:
 
@@ -1819,9 +1905,7 @@ async def mines_cash(
         reveal=True
     )
 
-    del mines_games[
-        user_id
-    ]
+    del mines_games[user_id]
 
     await query.edit_message_text(
         "💰 ҰТЫС АЛЫНДЫ!\n\n"
@@ -1835,31 +1919,81 @@ async def mines_cash(
 
 
 # =========================================================
+# ПОИСК ПОЛЬЗОВАТЕЛЯ В БД
+# =========================================================
+
+def find_user_by_username(
+    username
+):
+
+    username = (
+        username
+        .lower()
+        .lstrip("@")
+    )
+
+    with DB_LOCK:
+
+        return db.execute(
+            """
+            SELECT *
+            FROM users
+            WHERE lower(username) = ?
+            """,
+            (username,)
+        ).fetchone()
+
+
+def find_user_by_id(
+    user_id
+):
+
+    with DB_LOCK:
+
+        return db.execute(
+            """
+            SELECT *
+            FROM users
+            WHERE user_id = ?
+            """,
+            (user_id,)
+        ).fetchone()
+
+
+# =========================================================
 # ТЕКСТОВОЙ РОУТЕР
 # =========================================================
 
 async def text_router(
-    update,
-    context
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    text = (
-        update.message.text
-        .strip()
-    )
+    if (
+        not update.message
+        or not update.message.text
+    ):
+        return
+
+    text = update.message.text.strip()
+
+    if not text:
+        return
 
     low = text.lower()
 
-    # -----------------------------------------------------
-    # Баланс
-    # -----------------------------------------------------
+    # =====================================================
+    # БАЛАНС
+    # =====================================================
 
     if low in {
         "баланс",
         "б",
         "бал",
         "ақша",
+        "ақшам",
         "қаражат",
+        "балансым",
     }:
 
         await balance_command(
@@ -1869,9 +2003,9 @@ async def text_router(
 
         return
 
-    # -----------------------------------------------------
-    # Бонус
-    # -----------------------------------------------------
+    # =====================================================
+    # БОНУС
+    # =====================================================
 
     if low in {
         "бонус",
@@ -1890,14 +2024,34 @@ async def text_router(
 
         return
 
-    # -----------------------------------------------------
-    # История
-    # -----------------------------------------------------
+    # =====================================================
+    # ПОМОЩЬ
+    # =====================================================
+
+    if low in {
+        "көмек",
+        "помощь",
+        "help",
+        "командалар",
+        "команда",
+    }:
+
+        await help_command(
+            update,
+            context
+        )
+
+        return
+
+    # =====================================================
+    # ИСТОРИЯ
+    # =====================================================
 
     if low in {
         "тарих",
         "тарихы",
         "history",
+        "рулетка тарихы",
     }:
 
         await history_command(
@@ -1907,35 +2061,31 @@ async def text_router(
 
         return
 
-    # -----------------------------------------------------
-    # Мины
-    # -----------------------------------------------------
+    # =====================================================
+    # МИНЫ
+    # =====================================================
 
-    if low.startswith(
-        "мины "
-    ) or low.startswith(
-        "миналар "
+    if re.match(
+        r"^(мины|миналар)\b",
+        low
     ):
 
-        handled = await start_mines(
+        parts = text.split()
+
+        await start_mines(
             update,
-            text.split()
+            parts
         )
 
-        if handled:
+        return
 
-            return
-
-    # -----------------------------------------------------
-    # Переводы
-    # -----------------------------------------------------
+    # =====================================================
+    # ПЕРЕВОД
+    # =====================================================
 
     transfer_match = re.match(
-        r"^(бер|аудар|жібер|берем)"
-        r"\s+(\S+)"
-        r"(?:\s+(.+))?$",
-        text,
-        re.IGNORECASE
+        r"^(бер|аудар|жібер|берем)\s+(\S+)(?:\s+(.+))?$",
+        low
     )
 
     if transfer_match:
@@ -1950,55 +2100,93 @@ async def text_router(
 
         target_user = None
 
-        # Reply на сообщение.
-        if update.message.reply_to_message:
+        # -------------------------
+        # Reply
+        # -------------------------
 
-            replied_user = (
-                update
-                .message
+        if (
+            update.message.reply_to_message
+            and
+            update.message.reply_to_message.from_user
+        ):
+
+            target_user = (
+                update.message
                 .reply_to_message
                 .from_user
             )
 
-            if replied_user:
+        # -------------------------
+        # @username / ID
+        # -------------------------
 
-                ensure_user(
-                    replied_user
-                )
-
-                target_user = (
-                    replied_user
-                )
-
-        # @username / ID.
         elif target_text:
 
             target_text = (
                 target_text.strip()
             )
 
-            if target_text.startswith("@"):
+            username_match = re.fullmatch(
+                r"@([A-Za-z0-9_]{3,32})",
+                target_text
+            )
+
+            if username_match:
+
+                username = (
+                    username_match.group(1)
+                )
 
                 row = find_user_by_username(
-                    target_text
+                    username
                 )
 
-                target_user = row_to_user(
-                    row
-                )
+                if row:
+
+                    try:
+
+                        target_user = (
+                            await context.bot.get_chat(
+                                f"@{username}"
+                            )
+                        )
+
+                    except Exception:
+
+                        target_user = None
 
             elif re.fullmatch(
-                r"\d+",
+                r"-?\d+",
                 target_text
             ):
 
-                row = find_user_by_id(
-                    int(target_text)
-                )
+                try:
 
-                target_user = row_to_user(
-                    row
-                )
+                    target_id = int(
+                        target_text
+                    )
+
+                    row = find_user_by_id(
+                        target_id
+                    )
+
+                    if row:
+
+                        try:
+
+                            target_user = (
+                                await context.bot.get_chat(
+                                    target_id
+                                )
+                            )
+
+                        except Exception:
+
+                            target_user = None
+
+                except ValueError:
+
+                    target_user = None
 
         await transfer_command(
             update,
@@ -2008,56 +2196,76 @@ async def text_router(
 
         return
 
-    # -----------------------------------------------------
-    # Рулетка без слова "рулетка"
-    # -----------------------------------------------------
+    # =====================================================
+    # РУЛЕТКА
+    #
+    # Только:
+    #
+    # 2000 ақ
+    # 2000 а
+    # 2000 қара
+    # 2000 қ
+    # 2000 16
+    # 2000 16-30
+    # 2000 жұп
+    # 2000 тақ
+    # =====================================================
 
-    parts = text.split()
+    roulette_match = re.fullmatch(
+        r"(\S+)\s+(.+)",
+        text
+    )
 
-    if len(parts) == 2:
+    if roulette_match:
 
+        amount_text = (
+            roulette_match.group(1)
+        )
+
+        bet_text = (
+            roulette_match.group(2)
+            .strip()
+        )
+
+        # Если первое слово не сумма —
+        # это обычное сообщение.
         try:
 
             parse_amount(
-                parts[0]
+                amount_text
             )
-
-            if parse_bet(
-                parts[1]
-            ):
-
-                await play_roulette(
-                    update,
-                    parts[0],
-                    parts[1]
-                )
-
-                return
 
         except ValueError:
 
-            pass
+            return
 
-    # -----------------------------------------------------
-    # Неизвестная команда
-    # -----------------------------------------------------
+        # Если второе слово не ставка —
+        # тоже просто игнорируем.
+        if parse_bet(
+            bet_text
+        ) is None:
 
-    await update.message.reply_text(
-        "❓ Команда түсініксіз.\n\n"
-        "Мысалдар:\n"
-        "💰 баланс\n"
-        "🎁 бонус\n"
-        "🎰 1000 ақ\n"
-        "🎰 1000 16\n"
-        "🎰 1000 16-30\n"
-        "💣 мины 1000\n"
-        "💣 мины 1000 5\n"
-        "💸 бер 5к @username"
-    )
+            return
+
+        await play_roulette(
+            update,
+            amount_text,
+            bet_text
+        )
+
+        return
+
+    # =====================================================
+    # НЕИЗВЕСТНЫЕ СООБЩЕНИЯ
+    #
+    # НИЧЕГО НЕ ДЕЛАЕМ.
+    # =====================================================
+
+    return
 
 
 # =========================================================
-# RENDER HEALTH CHECK
+# HEALTH CHECK ДЛЯ RENDER
 # =========================================================
 
 class HealthHandler(
@@ -2066,9 +2274,7 @@ class HealthHandler(
 
     def do_GET(self):
 
-        self.send_response(
-            200
-        )
+        self.send_response(200)
 
         self.send_header(
             "Content-Type",
@@ -2078,7 +2284,7 @@ class HealthHandler(
         self.end_headers()
 
         self.wfile.write(
-            b"Bot is running"
+            b"OK"
         )
 
     def log_message(
@@ -2086,25 +2292,45 @@ class HealthHandler(
         format,
         *args
     ):
-
         return
 
 
-def run_health_server():
+def start_health_server():
 
     server = ThreadingHTTPServer(
-        (
-            "0.0.0.0",
-            PORT
-        ),
+        ("0.0.0.0", PORT),
         HealthHandler
     )
 
-    server.serve_forever()
+    thread = threading.Thread(
+        target=server.serve_forever,
+        daemon=True
+    )
+
+    thread.start()
+
+    print(
+        f"Health server started on port {PORT}"
+    )
 
 
 # =========================================================
-# ЗАПУСК
+# ОБРАБОТКА ОШИБОК
+# =========================================================
+
+async def error_handler(
+    update,
+    context
+):
+
+    print(
+        "BOT ERROR:",
+        repr(context.error)
+    )
+
+
+# =========================================================
+# MAIN
 # =========================================================
 
 def main():
@@ -2112,22 +2338,34 @@ def main():
     if not TOKEN:
 
         raise RuntimeError(
-            "BOT_TOKEN не найден "
-            "в Environment Variables"
+            "BOT_TOKEN не найден. "
+            "Добавь переменную BOT_TOKEN "
+            "в Environment Variables."
         )
 
-    if OWNER_ID == 0:
+    print(
+        "================================"
+    )
 
-        print(
-            "WARNING: OWNER_ID не установлен. "
-            "Промокоды создавать нельзя."
-        )
+    print(
+        "🇰🇿 Бот запускается..."
+    )
 
-    # Render видит открытый порт.
-    threading.Thread(
-        target=run_health_server,
-        daemon=True
-    ).start()
+    print(
+        f"Database: {DB_PATH}"
+    )
+
+    print(
+        f"Owner ID: {OWNER_ID}"
+    )
+
+    print(
+        "================================"
+    )
+
+    # Health server нужен,
+    # если Render использует Web Service.
+    start_health_server()
 
     application = (
         ApplicationBuilder()
@@ -2135,9 +2373,9 @@ def main():
         .build()
     )
 
-    # -----------------------------------------------------
-    # Команды
-    # -----------------------------------------------------
+    # =====================================================
+    # КОМАНДЫ
+    # =====================================================
 
     application.add_handler(
         CommandHandler(
@@ -2155,29 +2393,8 @@ def main():
 
     application.add_handler(
         CommandHandler(
-            "balance",
-            balance_command
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "bonus",
-            bonus_command
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
             "history",
             history_command
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "createp",
-            create_promo
         )
     )
 
@@ -2188,9 +2405,16 @@ def main():
         )
     )
 
-    # -----------------------------------------------------
-    # Mines callbacks
-    # -----------------------------------------------------
+    application.add_handler(
+        CommandHandler(
+            "createp",
+            create_promo
+        )
+    )
+
+    # =====================================================
+    # МИНЫ
+    # =====================================================
 
     application.add_handler(
         CallbackQueryHandler(
@@ -2206,9 +2430,11 @@ def main():
         )
     )
 
-    # -----------------------------------------------------
-    # Обычный текст
-    # -----------------------------------------------------
+    # =====================================================
+    # ТЕКСТ
+    #
+    # Команды Telegram сюда НЕ попадают.
+    # =====================================================
 
     application.add_handler(
         MessageHandler(
@@ -2218,14 +2444,34 @@ def main():
         )
     )
 
-    print(
-        "Бот іске қосылды."
+    # =====================================================
+    # ОШИБКИ
+    # =====================================================
+
+    application.add_error_handler(
+        error_handler
     )
+
+    print(
+        "🇰🇿 Бот іске қосылды."
+    )
+
+    print(
+        "💾 SQLite database active."
+    )
+
+    # =====================================================
+    # POLLING
+    # =====================================================
 
     application.run_polling(
         allowed_updates=Update.ALL_TYPES
     )
 
+
+# =========================================================
+# START
+# =========================================================
 
 if __name__ == "__main__":
     main()
