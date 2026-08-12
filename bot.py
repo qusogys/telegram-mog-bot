@@ -4,12 +4,20 @@ import sqlite3
 import secrets
 import threading
 import asyncio
+import logging
 from time import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
+
+# Настройка логирования для отладки
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
@@ -20,7 +28,6 @@ BONUS_AMOUNT = 5_000
 BONUS_COOLDOWN = 4 * 60 * 60  # 4 сағат
 
 DB_LOCK = threading.RLock()
-# isolation_level=None отключит конфликт встроенных транзакций Python с ручным BEGIN IMMEDIATE
 db = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
 db.row_factory = sqlite3.Row
 
@@ -51,7 +58,7 @@ with DB_LOCK:
 RED_NUMBERS = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
 
 games = {}  # Мины
-roulette_games = {}  # Групповая рулетка: {chat_id: {"bets": [...], "task": asyncio.Task}}
+roulette_games = {}  # Групповая рулетка
 
 
 def ts():
@@ -82,6 +89,8 @@ def parse_amount(s):
 
 
 def ensure_user(u):
+    if not u or u.is_bot:
+        return
     with DB_LOCK:
         db.execute("""INSERT INTO users(user_id,username,first_name,balance)
                       VALUES(?,?,?,?)
@@ -141,7 +150,8 @@ def atomic_transfer(sender, receiver, amount):
                 return False
             db.execute("COMMIT")
             return True
-        except Exception:
+        except Exception as e:
+            logger.error(f"Transfer error: {e}")
             db.execute("ROLLBACK")
             return False
 
@@ -166,7 +176,6 @@ def parse_bet(text):
     if m:
         a, b = int(m.group(1)), int(m.group(2))
         if 0 <= a <= b <= 36:
-            # Запрещаем диапазоны крупнее 18 чисел для предотвращения абуза
             if (b - a) > 18:
                 return None
             return ("range", (a, b))
@@ -214,7 +223,7 @@ def result_name(n):
     return f"⚪ {n}" if n in RED_NUMBERS else f"⚫ {n}"
 
 
-async def start(update, context):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user)
     await update.message.reply_text(
         "🇰🇿 Сәлем! Теңгелік экономика ботына қош келдің!\n\n"
@@ -230,14 +239,14 @@ async def start(update, context):
     )
 
 
-async def balance_cmd(update, context):
+async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user)
     await update.message.reply_text(
         f"💰 Балансың: {fmt(get_balance(update.effective_user.id))} ₸"
     )
 
 
-async def bonus_cmd(update, context):
+async def bonus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user)
     uid = update.effective_user.id
 
@@ -245,7 +254,7 @@ async def bonus_cmd(update, context):
         row = db.execute(
             "SELECT last_bonus FROM users WHERE user_id=?", (uid,)
         ).fetchone()
-        last = int(row["last_bonus"])
+        last = int(row["last_bonus"]) if row else 0
 
         left = BONUS_COOLDOWN - (ts() - last)
         if left > 0:
@@ -257,8 +266,7 @@ async def bonus_cmd(update, context):
             return
 
         db.execute(
-            "UPDATE users SET balance=balance+?, last_bonus=? "
-            "WHERE user_id=?",
+            "UPDATE users SET balance=balance+?, last_bonus=? WHERE user_id=?",
             (BONUS_AMOUNT, ts(), uid)
         )
 
@@ -268,16 +276,15 @@ async def bonus_cmd(update, context):
     )
 
 
-# --- ЛОГИКА ГРУППОВОЙ РУЛЕТКИ ---
+# --- ГРУППОВАЯ РУЛЕТКА ---
 
 async def auto_spin_timer(chat_id, context, timeout=120):
-    """Таймер ожидания: если никто не написал «го», бот скрутит сам через 2 минуты."""
     await asyncio.sleep(timeout)
     if chat_id in roulette_games and roulette_games[chat_id]["bets"]:
         await spin_roulette(chat_id, context)
 
 
-async def place_bet(update, amount_text, bet_text, context):
+async def place_bet(update: Update, amount_text, bet_text, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     ensure_user(user)
@@ -291,8 +298,7 @@ async def place_bet(update, amount_text, bet_text, context):
     bet = parse_bet(bet_text)
     if not bet:
         await update.message.reply_text(
-            "❌ Ставка түсініксіз.\n"
-            "Мысал: 2000 ақ, 2000 16, 2000 16-30."
+            "❌ Ставка түсініксіз.\nМысал: 2000 ақ, 2000 16, 2000 16-30."
         )
         return
 
@@ -308,7 +314,6 @@ async def place_bet(update, amount_text, bet_text, context):
         )
         return
 
-    # Создаем сессию игры в чате, если еще нет
     if chat_id not in roulette_games:
         timer_task = asyncio.create_task(auto_spin_timer(chat_id, context))
         roulette_games[chat_id] = {
@@ -316,7 +321,6 @@ async def place_bet(update, amount_text, bet_text, context):
             "task": timer_task
         }
 
-    # Добавляем ставку
     roulette_games[chat_id]["bets"].append({
         "user_id": user.id,
         "first_name": user.first_name,
@@ -334,13 +338,13 @@ async def place_bet(update, amount_text, bet_text, context):
     )
 
 
-async def spin_roulette(chat_id, context):
+async def spin_roulette(chat_id, context: ContextTypes.DEFAULT_TYPE):
     if chat_id not in roulette_games or not roulette_games[chat_id]["bets"]:
         return
 
     game = roulette_games.pop(chat_id)
     if game["task"]:
-        game["task"].cancel()  # Отменяем таймер автоматической прокрутки
+        game["task"].cancel()
 
     bets = game["bets"]
     result = secrets.randbelow(37)
@@ -368,7 +372,7 @@ async def spin_roulette(chat_id, context):
     await context.bot.send_message(chat_id=chat_id, text="\n".join(res_msg))
 
 
-async def spin_cmd(update, context):
+async def spin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id not in roulette_games or not roulette_games[chat_id]["bets"]:
         await update.message.reply_text("❌ Әлі ешкім ставка тігген жоқ!")
@@ -376,11 +380,49 @@ async def spin_cmd(update, context):
     await spin_roulette(chat_id, context)
 
 
+# --- ПЕРЕВОДЫ ДЕНЕГ ---
+
+async def transfer(update: Update, amount_text, target_user_ref):
+    ensure_user(update.effective_user)
+    sender = update.effective_user
+
+    try:
+        amount = parse_amount(amount_text)
+    except ValueError:
+        await update.message.reply_text("❌ Сома қате. Мысалы: 5000, 5к немесе 2.5кк.")
+        return
+
+    if not target_user_ref:
+        await update.message.reply_text(
+            "❌ Алушы табылмады!\n"
+            "Бұл қолданушы базада жоқ. Ол бот бар чатқа ең болмағанда бір хабарлама жазуы керек."
+        )
+        return
+
+    if target_user_ref["id"] == sender.id:
+        await update.message.reply_text("❌ Өзіңе ақша жібере алмайсың.")
+        return
+
+    if not atomic_transfer(sender.id, target_user_ref["id"], amount):
+        await update.message.reply_text(
+            f"❌ Қаражатың жеткіліксіз.\n"
+            f"Қолжетімді: {fmt(get_balance(sender.id))} ₸\n"
+            f"Қажет: {fmt(amount)} ₸"
+        )
+        return
+
+    await update.message.reply_text(
+        f"💸 {fmt(amount)} ₸ {target_user_ref['first_name']} деген қолданушыға жіберілді."
+    )
+
+
 # --- ОБРАБОТЧИК СООБЩЕНИЙ ---
 
-async def text_router(update, context):
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
+
+    ensure_user(update.effective_user)
 
     text = update.message.text.strip()
     low = text.lower()
@@ -397,57 +439,65 @@ async def text_router(update, context):
         await help_cmd(update, context)
         return
 
-    # Команда запуска рулетки
     if low in {"го", "кеттік", "кеттик", "ехала", "поехали", "крути", "старт"}:
         await spin_cmd(update, context)
         return
 
-    # Мины
     if low.startswith("мины ") or low.startswith("миналар "):
         if await mines_start(update, context):
             return
 
-    # Переводы
-    m = re.match(r"^(бер|аудар|жібер|берем)\s+(\S+)(?:\s+(.+))?$", low)
-    if m:
-        target = None
-        if update.message.reply_to_message:
-            target = update.message.reply_to_message.from_user
-        elif m.group(3):
-            raw = m.group(3).strip()
-            if raw.startswith("@"):
-                username = raw[1:].lower()
-                with DB_LOCK:
-                    row = db.execute(
-                        "SELECT * FROM users WHERE lower(username)=?", (username,)
-                    ).fetchone()
-                if row:
-                    class UserRef: pass
-                    target = UserRef()
-                    target.id = row["user_id"]
-                    target.username = row["username"]
-                    target.first_name = row["first_name"] or username
-            elif raw.isdigit():
-                uid = int(raw)
-                with DB_LOCK:
-                    row = db.execute(
-                        "SELECT * FROM users WHERE user_id=?", (uid,)
-                    ).fetchone()
-                if row:
-                    class UserRef: pass
-                    target = UserRef()
-                    target.id = uid
-                    target.username = row["username"]
-                    target.first_name = row["first_name"] or str(uid)
+    # Обработка переводов ("бер 10к @b5syn", "аудар 5000" ответом и т.д.)
+    m_transfer = re.match(r"^(бер|аудар|жібер|берем)\s+(\S+)(?:\s+(.+))?$", low)
+    if m_transfer:
+        amount_str = m_transfer.group(2)
+        target_info = None
 
-        await transfer(update, m.group(2), target)
+        # 1. Если это ответ на сообщение (Reply)
+        if update.message.reply_to_message:
+            rep_u = update.message.reply_to_message.from_user
+            ensure_user(rep_u)
+            target_info = {"id": rep_u.id, "first_name": rep_u.first_name}
+
+        # 2. Если юзернейм/ID указан текстом
+        elif m_transfer.group(3):
+            raw_target = m_transfer.group(3).strip()
+            
+            # Извлечение из Mentions/Текста
+            username = None
+            if raw_target.startswith("@"):
+                username = raw_target[1:].lower()
+            elif update.message.entities:
+                for entity in update.message.entities:
+                    if entity.type == "mention":
+                        username = text[entity.offset + 1 : entity.offset + entity.length].lower()
+
+            if username:
+                with DB_LOCK:
+                    row = db.execute(
+                        "SELECT user_id, first_name, username FROM users WHERE lower(username)=?",
+                        (username,)
+                    ).fetchone()
+                if row:
+                    target_info = {"id": row["user_id"], "first_name": row["first_name"] or row["username"]}
+
+            elif raw_target.isdigit():
+                uid = int(raw_target)
+                with DB_LOCK:
+                    row = db.execute(
+                        "SELECT user_id, first_name FROM users WHERE user_id=?", (uid,)
+                    ).fetchone()
+                if row:
+                    target_info = {"id": uid, "first_name": row["first_name"] or str(uid)}
+
+        await transfer(update, amount_str, target_info)
         return
 
-    # Рулетка: "2000 ақ", "2000 16", "2000 16-30" или "рулетка 2000 ақ"
-    m = re.match(r"^(?:рулетка\s+)?(\S+)\s+(.+)$", low)
-    if m:
-        amount_token = m.group(1)
-        bet_token = m.group(2).strip()
+    # Рулетка ("2000 ақ", "2000 16")
+    m_roulette = re.match(r"^(?:рулетка\s+)?(\S+)\s+(.+)$", low)
+    if m_roulette:
+        amount_token = m_roulette.group(1)
+        bet_token = m_roulette.group(2).strip()
 
         try:
             parse_amount(amount_token)
@@ -458,9 +508,9 @@ async def text_router(update, context):
             await place_bet(update, amount_token, bet_token, context)
 
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (МИНОИ, ПЕРЕВОДЫ, ПРОМО) ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
-async def mines_start(update, context):
+async def mines_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = update.message.text.split()
     if len(parts) != 3:
         return False
@@ -478,7 +528,6 @@ async def mines_start(update, context):
     uid = update.effective_user.id
     ensure_user(update.effective_user)
 
-    # Замена софтлока: разрешаем пересоздавать игру
     if uid in games:
         await update.message.reply_text("⚠️ Алдыңғы мина ойыны жойылды (ставка қайтарылмайды). Жаңа ойын басталды!")
 
@@ -543,7 +592,7 @@ def mines_multiplier(safe, mines):
     return max(1.01, mult)
 
 
-async def mines_callback(update, context):
+async def mines_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
@@ -585,7 +634,7 @@ async def mines_callback(update, context):
     await send_mines_board(q, uid)
 
 
-async def mines_cash_callback(update, context):
+async def mines_cash_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
@@ -613,43 +662,7 @@ async def mines_cash_callback(update, context):
     )
 
 
-async def transfer(update, amount_text, target):
-    ensure_user(update.effective_user)
-    sender = update.effective_user
-
-    try:
-        amount = parse_amount(amount_text)
-    except ValueError:
-        await update.message.reply_text("❌ Сома қате. Мысалы: 5000, 5к немесе 2.5кк.")
-        return
-
-    if not target:
-        await update.message.reply_text(
-            "❌ Алушы көрсетілмеді.\n"
-            "Жауап ретінде «бер 5к» жаз немесе «бер 5к @username»."
-        )
-        return
-
-    if target.id == sender.id:
-        await update.message.reply_text("❌ Өзіңе ақша жібере алмайсың.")
-        return
-
-    ensure_user(target)
-
-    if not atomic_transfer(sender.id, target.id, amount):
-        await update.message.reply_text(
-            f"❌ Қаражатың жеткіліксіз.\n"
-            f"Қолжетімді: {fmt(get_balance(sender.id))} ₸\n"
-            f"Қажет: {fmt(amount)} ₸"
-        )
-        return
-
-    await update.message.reply_text(
-        f"💸 {fmt(amount)} ₸ {target.first_name} деген қолданушыға жіберілді."
-    )
-
-
-async def create_promo(update, context):
+async def create_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("❌ Бұл команда тек бот иесіне арналған.")
         return
@@ -683,7 +696,7 @@ async def create_promo(update, context):
     )
 
 
-async def use_promo(update, context):
+async def use_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user)
     if len(context.args) != 1:
         await update.message.reply_text("Формат: /promo КОД")
@@ -717,7 +730,8 @@ async def use_promo(update, context):
             db.execute("UPDATE promo_codes SET used_count=used_count+1 WHERE code=?", (code,))
             db.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (promo["amount"], uid))
             db.execute("COMMIT")
-        except Exception:
+        except Exception as e:
+            logger.error(f"Promo error: {e}")
             db.execute("ROLLBACK")
             await update.message.reply_text("❌ Промокодты қолдану кезінде қате болды.")
             return
@@ -725,7 +739,7 @@ async def use_promo(update, context):
     await update.message.reply_text(f"🎁 Промокод қабылданды!\n+{fmt(promo['amount'])} ₸")
 
 
-async def help_cmd(update, context):
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🇰🇿 КӨМЕК\n\n"
         "💰 Баланс: баланс / б / бал\n"
@@ -759,7 +773,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
-    print("Бот іске қосылды.")
+    logger.info("Бот іске қосылды.")
     app.run_polling(drop_pending_updates=True)
 
 
